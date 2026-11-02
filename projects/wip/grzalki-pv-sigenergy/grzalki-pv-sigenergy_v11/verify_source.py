@@ -149,6 +149,13 @@ class SourceContracts(unittest.TestCase):
         poll = body(SKETCH, "void pollModbus()")
         self.assertIn("cfg.map == 2 && autoMapLatched && activeMap == 0", poll)
 
+    def test_grid_value_stays_on_screen_when_sample_invalidated(self):
+        publish = body(CONTROL, "void publish(")
+        # Publishing NAN made channel 5 blank on every MANUAL switch.
+        self.assertIn("s.gridWatts = gridWatts;", publish)
+        self.assertNotIn("s.gridFresh ? gridWatts : NAN", publish)
+        self.assertIn("s.gridFresh = gridFresh(millis())", publish)
+
     def test_documented_sigenergy_defaults_and_v6_v7_map(self):
         self.assertRegex(SETTINGS, r"\bmap\s*=\s*2\b")
         self.assertRegex(SETTINGS, r"\breg\s*=\s*30005\b")

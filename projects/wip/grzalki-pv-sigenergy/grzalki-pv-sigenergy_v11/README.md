@@ -163,6 +163,11 @@ To dobra ścieżka awaryjna, ale tracisz wtedy kontrolę statusu przekładnika.
 
 ### Co oznaczają komunikaty SIG
 
+Kanał 5 pokazuje **ostatnią zaakceptowaną** wartość mocy sieci. Jeśli próbka
+jest nieświeża, wartość zostaje na ekranie, a kanał 4 („Brak danych Modbus”)
+przechodzi w alarm. Wcześniej program wysyłał `NAN`, więc kanał pokazywał `---`
+na kilka sekund przy każdym przełączeniu MANUAL i wyglądało to jak reset kanału.
+
 ```
 SIG GRID map=2 req=0 active=0 result=0 raw=0000:01F4 status=1 ongrid=0 grid=500.0W ct=1 on=1 pv=... ess=... soc=... swapped=0 age=12ms
 ```

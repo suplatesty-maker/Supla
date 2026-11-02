@@ -438,7 +438,14 @@ class Engine {
     s.dacFault = dacFault;
     s.temperature = temperature;
     s.gridFresh = gridFresh(millis());
-    s.gridWatts = s.gridFresh ? gridWatts : NAN;
+    // Keep the last accepted reading on screen instead of publishing NAN.
+    // Any MANUAL mode change (and every fault revoke) bumps the generation and
+    // invalidates the sample for CONTROL; publishing NAN made SUPLA channel 5
+    // show "---" for several seconds on each heater switch, which looked like
+    // the channel resetting. Staleness is reported separately in s.gridFresh
+    // (SUPLA alarm channel 4), and AUTO still refuses to heat without a fresh
+    // sample, so showing the last value is display-only.
+    s.gridWatts = gridWatts;
     // An old snapshot must never undo a newer mode change/fault revocation.
     s.requestAllowed = generation == mailbox.data.command.generation &&
         allowed(mailbox.data.command, millis());

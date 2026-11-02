@@ -1,5 +1,36 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-02: v11 wgrana, kanał mocy nie gaśnie przy przełączaniu
+
+**v11 wgrana na ESP32 (port CH340, 460800, hash zweryfikowany). Grzałki 230 V
+były odłączone.** Testy z obciążeniem nadal niewykonane.
+
+- **Naprawiony błąd konfiguracji:** domyślny bufor LittleFS 1024 B był za mały
+  dla v11. Log pokazywał `serialized configuration size is too big` i
+  `Key authkey, curBlockSize 34, maxSize 10`, więc AuthKey nie był zapisywany
+  i powstawał nowy przy każdym starcie (nowa tożsamość w SUPLA). Ustawiono
+  `Supla::LittleFsConfig storage(2048)`. Po dwóch restartach GUID i AuthKey są
+  stabilne, brak komunikatu o przepełnieniu. Konfiguracji nie kasowano.
+- **Naprawiony wygląd kanału 5:** `publish()` wysyłał `NAN`, gdy próbka sieci
+  była nieświeża. Każda zmiana trybu MANUAL i każde unieważnienie po awarii
+  zwiększa generację, więc kanał „Sigenergy moc sieci” pokazywał `---` na
+  kilka sekund przy każdym przełączeniu grzałki. Wyglądało to jak reset kanału
+  albo kolizja. Teraz publikowana jest ostatnia zaakceptowana wartość, a
+  nieświeżość sygnalizuje osobny kanał 4 („Brak danych Modbus”). Sterowanie
+  AUTO nadal wymaga świeżej próbki, więc zmiana jest wyłącznie wyświetlaniem.
+- Weryfikacja: `verify_source.py` **26/26 OK**, kompilacja **EXIT=0**,
+  flash 1 401 703 B (44%), RAM 52 260 B (15%).
+- **Uwaga:** ostatnia próba wgrania tej poprawki nie powiodła się, bo port
+  `/dev/cu.usbserial-2110` zniknął z systemu przed zapisem. Poprawka jest
+  skompilowana, ale na płytce działa jeszcze wersja bez zmiany wyświetlania.
+- Objawy gołej płytki są poprawne: `DACfault=1` (brak GP8403), temperatura
+  `-275` i `sensorFault=1` (brak DS18B20), kanał 3 i 7 w stanie alarmu.
+- WiFi `HUAWEI` nie łączy się: `WiFi Station disconnected` / `sta is connecting,
+  return error` w pętli. Najczęściej sieć nadaje tylko w 5 GHz; ESP32 obsługuje
+  wyłącznie 2,4 GHz.
+- Bez DS18B20 MANUAL jest zablokowany celowo. Do testu suwaków trzeba podłączyć
+  czujnik na GPIO4.
+
 ## Aktualizacja 2026-10-28: v11, rozdzielenie MANUAL od DAC/Sigenergy
 
 **Nowy szkic: `grzalki-pv-sigenergy_v11/`. Gałąź od v8. Nie wgrany na płytkę,
