@@ -1,0 +1,378 @@
+/// @file tuning_config.cpp
+/// @brief Runtime tuning configuration helpers and snapshot formatting.
+/// @ingroup hioc_tuning
+
+#include "tuning_config.h"
+
+#include "proto_constants.h"
+#include "tuning_registry.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+
+namespace esphome {
+namespace home_io_control {
+
+namespace {
+
+/// Default tuning configuration used for diffing and reset behavior.
+const TuningConfig DEFAULTS{};
+
+/// Buffer size for a formatted single hex byte such as "0x2E" (4 chars + slack).
+constexpr size_t HEX_BYTE_STR_SIZE = 8;
+/// Buffer size for a formatted 3-byte hex address such as "0x00003B".
+constexpr size_t HEX_ADDR_STR_SIZE = 16;
+/// Buffer size for a formatted bandwidth string such as "117.3kHz".
+constexpr size_t BANDWIDTH_STR_SIZE = 16;
+
+/// One selectable RX bandwidth per chip: register byte plus its nominal kHz value.
+///
+/// SX1262 and LR1121 share the Semtech GFSK bandwidth grid, so these two tables are
+/// byte-for-byte identical today (the `Sx1262AndLr1121BandwidthTablesAgree` test pins that);
+/// they are kept separate only so each chip's option set can diverge for a real chip
+/// difference. SX1276 has its own RegRxBw encoding. Keys must match `tuning.py`'s
+/// `*_BANDWIDTH_OPTIONS`, which `scripts/check-tuning-sync.py` verifies.
+// The register byte in every row comes from the chip's bandwidth enum so it keeps exactly one
+// definition; the kHz literal is this table's only added datum. `scripts/check-tuning-sync.py`
+// pins the kHz column against `tuning.py`; the enum cast pins the register byte.
+constexpr BandwidthOption SX1262_BANDWIDTHS[] = {
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_39_0_KHZ), 39.0F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_46_9_KHZ), 46.9F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_58_6_KHZ), 58.6F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_78_2_KHZ), 78.2F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_117_3_KHZ), 117.3F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_156_2_KHZ), 156.2F},
+    {static_cast<uint8_t>(SX1262RxBandwidth::BW_187_2_KHZ), 187.2F},
+};
+constexpr BandwidthOption SX1276_BANDWIDTHS[] = {
+    {static_cast<uint8_t>(SX1276RxBandwidth::BW_20_8_KHZ), 20.8F},
+    {static_cast<uint8_t>(SX1276RxBandwidth::BW_41_7_KHZ), 41.7F},
+    {static_cast<uint8_t>(SX1276RxBandwidth::BW_62_5_KHZ), 62.5F},
+    {static_cast<uint8_t>(SX1276RxBandwidth::BW_83_3_KHZ), 83.3F},
+    {static_cast<uint8_t>(SX1276RxBandwidth::BW_125_0_KHZ), 125.0F},
+};
+constexpr BandwidthOption LR1121_BANDWIDTHS[] = {
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_39_0_KHZ), 39.0F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_46_9_KHZ), 46.9F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_58_6_KHZ), 58.6F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_78_2_KHZ), 78.2F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_117_3_KHZ), 117.3F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_156_2_KHZ), 156.2F},
+    {static_cast<uint8_t>(LR1121RxBandwidth::BW_187_2_KHZ), 187.2F},
+};
+
+/// kHz returned for a register byte not in the chip's table — the chip's configured default,
+/// matching the fall-through of the previous per-chip switch statements.
+constexpr float SX1262_BW_FALLBACK_KHZ = 117.3F;
+constexpr float SX1276_BW_FALLBACK_KHZ = 41.7F;
+constexpr float LR1121_BW_FALLBACK_KHZ = 117.3F;
+
+template<size_t N> constexpr size_t bw_count(const BandwidthOption (& /*table*/)[N]) { return N; }
+
+}  // namespace
+
+float bandwidth_to_khz(const BandwidthOption *table, size_t n, uint8_t reg, float fallback) {
+  for (size_t i = 0; i < n; ++i) {
+    if (table[i].reg == reg)
+      return table[i].khz;
+  }
+  return fallback;
+}
+
+std::string bandwidth_to_string(float khz) {
+  char buf[BANDWIDTH_STR_SIZE];
+  snprintf(buf, sizeof(buf), "%.1f", khz);
+  return std::string(buf);
+}
+
+std::optional<uint8_t> bandwidth_from_string(const BandwidthOption *table, size_t n, const std::string &value) {
+  std::string normalized = value;
+  // Normalize: strip whitespace and a trailing "kHz"/"khz" suffix.
+  normalized.erase(std::remove_if(normalized.begin(), normalized.end(), ::isspace), normalized.end());
+  for (char &c : normalized)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (normalized.size() > 3 && normalized.ends_with("khz"))
+    normalized.resize(normalized.size() - 3);
+
+  for (size_t i = 0; i < n; ++i) {
+    char one_decimal[BANDWIDTH_STR_SIZE];
+    char truncated[BANDWIDTH_STR_SIZE];
+    snprintf(one_decimal, sizeof(one_decimal), "%.1f", table[i].khz);
+    snprintf(truncated, sizeof(truncated), "%d", static_cast<int>(table[i].khz));
+    if (normalized == one_decimal || normalized == truncated)
+      return table[i].reg;
+  }
+  return std::nullopt;
+}
+
+BandwidthTableView sx1262_bandwidth_table() { return {SX1262_BANDWIDTHS, bw_count(SX1262_BANDWIDTHS)}; }
+BandwidthTableView sx1276_bandwidth_table() { return {SX1276_BANDWIDTHS, bw_count(SX1276_BANDWIDTHS)}; }
+BandwidthTableView lr1121_bandwidth_table() { return {LR1121_BANDWIDTHS, bw_count(LR1121_BANDWIDTHS)}; }
+
+float sx1262_bandwidth_to_khz(SX1262RxBandwidth bw) {
+  return bandwidth_to_khz(SX1262_BANDWIDTHS, bw_count(SX1262_BANDWIDTHS), static_cast<uint8_t>(bw),
+                          SX1262_BW_FALLBACK_KHZ);
+}
+
+std::string sx1262_bandwidth_to_string(SX1262RxBandwidth bw) {
+  return bandwidth_to_string(sx1262_bandwidth_to_khz(bw));
+}
+
+std::optional<SX1262RxBandwidth> sx1262_bandwidth_from_string(const std::string &value) {
+  if (const auto reg = bandwidth_from_string(SX1262_BANDWIDTHS, bw_count(SX1262_BANDWIDTHS), value))
+    return static_cast<SX1262RxBandwidth>(*reg);
+  return std::nullopt;
+}
+
+float sx1276_bandwidth_to_khz(SX1276RxBandwidth bw) {
+  return bandwidth_to_khz(SX1276_BANDWIDTHS, bw_count(SX1276_BANDWIDTHS), static_cast<uint8_t>(bw),
+                          SX1276_BW_FALLBACK_KHZ);
+}
+
+std::string sx1276_bandwidth_to_string(SX1276RxBandwidth bw) {
+  return bandwidth_to_string(sx1276_bandwidth_to_khz(bw));
+}
+
+std::optional<SX1276RxBandwidth> sx1276_bandwidth_from_string(const std::string &value) {
+  if (const auto reg = bandwidth_from_string(SX1276_BANDWIDTHS, bw_count(SX1276_BANDWIDTHS), value))
+    return static_cast<SX1276RxBandwidth>(*reg);
+  return std::nullopt;
+}
+
+float lr1121_bandwidth_to_khz(LR1121RxBandwidth bw) {
+  return bandwidth_to_khz(LR1121_BANDWIDTHS, bw_count(LR1121_BANDWIDTHS), static_cast<uint8_t>(bw),
+                          LR1121_BW_FALLBACK_KHZ);
+}
+
+std::string lr1121_bandwidth_to_string(LR1121RxBandwidth bw) {
+  return bandwidth_to_string(lr1121_bandwidth_to_khz(bw));
+}
+
+std::optional<LR1121RxBandwidth> lr1121_bandwidth_from_string(const std::string &value) {
+  if (const auto reg = bandwidth_from_string(LR1121_BANDWIDTHS, bw_count(LR1121_BANDWIDTHS), value))
+    return static_cast<LR1121RxBandwidth>(*reg);
+  return std::nullopt;
+}
+
+std::optional<DiscoveryCommand> discovery_command_from_string(const std::string &value) {
+  std::string normalized = value;
+  for (char &c : normalized)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (normalized == "0x28" || normalized == "discover")
+    return DiscoveryCommand::DISCOVER;
+  if (normalized == "0x2a" || normalized == "discover_spe")
+    return DiscoveryCommand::DISCOVER_SPE;
+  if (normalized == "0x2e" || normalized == "discover_alt")
+    return DiscoveryCommand::DISCOVER_ALT;
+  return std::nullopt;
+}
+
+std::string discovery_command_to_string(DiscoveryCommand cmd) {
+  char buf[HEX_BYTE_STR_SIZE];
+  snprintf(buf, sizeof(buf), "0x%02X", static_cast<uint8_t>(cmd));
+  return std::string(buf);
+}
+
+std::string discovery_commands_to_csv(const std::vector<DiscoveryCommand> &commands) {
+  std::string result;
+  for (size_t i = 0; i < commands.size(); ++i) {
+    if (i > 0)
+      result += ',';
+    result += discovery_command_to_string(commands[i]);
+  }
+  return result;
+}
+
+std::string discovery_commands_to_string(const std::vector<DiscoveryCommand> &commands) {
+  return "[" + discovery_commands_to_csv(commands) + "]";
+}
+
+const uint8_t *resolve_discovery_destination(uint8_t command, bool destination_auto,
+                                             const uint8_t destination[NODE_ID_SIZE]) {
+  if (!destination_auto)
+    return destination;
+  // Conventional destinations from the protocol / reference captures: standard and SPE
+  // discovery broadcast to 0x00003B; alternate discovery (0x2E) broadcasts to 0x00003F.
+  switch (command) {
+    case CMD_DISCOVER_REQ:
+    case CMD_DISCOVER_SPE_REQ:
+      return BROADCAST_DISCOVER;
+    case CMD_DISCOVER_ALT_REQ:
+      return BROADCAST_DISCOVER_ALT;
+    default:
+      return BROADCAST_DISCOVER;
+  }
+}
+
+std::string discovery_destination_to_string(bool destination_auto, const uint8_t destination[NODE_ID_SIZE]) {
+  if (destination_auto)
+    return "auto";
+  char buf[HEX_ADDR_STR_SIZE];
+  snprintf(buf, sizeof(buf), "0x%02X%02X%02X", destination[0], destination[1], destination[2]);
+  return std::string(buf);
+}
+
+std::string discovery_payload_to_string(bool payload_enabled, uint8_t payload) {
+  if (!payload_enabled)
+    return "none";
+  char buf[HEX_BYTE_STR_SIZE];
+  snprintf(buf, sizeof(buf), "0x%02X", payload);
+  return std::string(buf);
+}
+
+std::string scan_power_classes_to_string(ScanPowerClasses value) {
+  switch (value) {
+    case ScanPowerClasses::BOTH:
+      return "both";
+    case ScanPowerClasses::ALWAYS_ALIVE:
+      return power_save_mode_name(POWER_SAVE_ALWAYS_ALIVE);
+    case ScanPowerClasses::LOW_POWER:
+      return power_save_mode_name(POWER_SAVE_LOW_POWER);
+  }
+  return "both";
+}
+
+std::optional<ScanPowerClasses> scan_power_classes_from_string(const std::string &value) {
+  if (value == scan_power_classes_to_string(ScanPowerClasses::BOTH))
+    return ScanPowerClasses::BOTH;
+  if (value == scan_power_classes_to_string(ScanPowerClasses::ALWAYS_ALIVE))
+    return ScanPowerClasses::ALWAYS_ALIVE;
+  if (value == scan_power_classes_to_string(ScanPowerClasses::LOW_POWER))
+    return ScanPowerClasses::LOW_POWER;
+  return std::nullopt;
+}
+
+bool scan_power_classes_include(ScanPowerClasses selection, uint8_t power_save_mode) {
+  switch (selection) {
+    case ScanPowerClasses::BOTH:
+      return power_save_mode == POWER_SAVE_ALWAYS_ALIVE || power_save_mode == POWER_SAVE_LOW_POWER;
+    case ScanPowerClasses::ALWAYS_ALIVE:
+      return power_save_mode == POWER_SAVE_ALWAYS_ALIVE;
+    case ScanPowerClasses::LOW_POWER:
+      return power_save_mode == POWER_SAVE_LOW_POWER;
+  }
+  return false;
+}
+
+std::string discover_confirm_mode_to_string(DiscoverConfirmMode value) {
+  switch (value) {
+    case DiscoverConfirmMode::SKIP:
+      return "skip";
+    case DiscoverConfirmMode::SEND:
+      return "send";
+    case DiscoverConfirmMode::SEND_WITH_ACK:
+      return "send_with_ack";
+  }
+  return "send";
+}
+
+std::optional<DiscoverConfirmMode> discover_confirm_mode_from_string(const std::string &value) {
+  if (value == discover_confirm_mode_to_string(DiscoverConfirmMode::SKIP))
+    return DiscoverConfirmMode::SKIP;
+  if (value == discover_confirm_mode_to_string(DiscoverConfirmMode::SEND))
+    return DiscoverConfirmMode::SEND;
+  if (value == discover_confirm_mode_to_string(DiscoverConfirmMode::SEND_WITH_ACK))
+    return DiscoverConfirmMode::SEND_WITH_ACK;
+  return std::nullopt;
+}
+
+std::string discovery_listen_channels_to_string(DiscoveryListenChannels value) {
+  switch (value) {
+    case DiscoveryListenChannels::SKIP_REQUEST:
+      return "skip_request";
+    case DiscoveryListenChannels::ALL:
+      return "all";
+  }
+  return "skip_request";
+}
+
+std::optional<DiscoveryListenChannels> discovery_listen_channels_from_string(const std::string &value) {
+  if (value == discovery_listen_channels_to_string(DiscoveryListenChannels::SKIP_REQUEST))
+    return DiscoveryListenChannels::SKIP_REQUEST;
+  if (value == discovery_listen_channels_to_string(DiscoveryListenChannels::ALL))
+    return DiscoveryListenChannels::ALL;
+  return std::nullopt;
+}
+
+std::string tuning_update_log_line(const std::string &name, const std::string &value) {
+  return "Tuning updated via HA: " + name + "=" + value;
+}
+
+std::string tuning_config_snapshot(const TuningConfig &cfg) {
+  std::string result;
+
+  // The three RX-bandwidth fields are enums, not plain numbers, so they stay hand-written here
+  // rather than going through the numeric loop below (they're SELECT_PARAMS, not NUMBER_PARAMS,
+  // in tuning_registry.cpp).
+  if (cfg.sx1262_rx_bandwidth != DEFAULTS.sx1262_rx_bandwidth)
+    result += " sx1262_rx_bandwidth=" + sx1262_bandwidth_to_string(cfg.sx1262_rx_bandwidth);
+  if (cfg.sx1276_rx_bandwidth != DEFAULTS.sx1276_rx_bandwidth)
+    result += " sx1276_rx_bandwidth=" + sx1276_bandwidth_to_string(cfg.sx1276_rx_bandwidth);
+  if (cfg.lr1121_rx_bandwidth != DEFAULTS.lr1121_rx_bandwidth)
+    result += " lr1121_rx_bandwidth=" + lr1121_bandwidth_to_string(cfg.lr1121_rx_bandwidth);
+
+  // Every plain numeric field is driven off the same NUMBER_PARAMS table the HA `number` entities
+  // and `make tuning-sync` use (tuning_registry.cpp) — not a second, independently-maintained list
+  // of field names. A hand-written per-field if-chain here once let a real, shipped knob
+  // (`pairing_discovery_preamble`) go completely missing from this exact diagnostic line — the one
+  // `discover_and_pair()` logs at the start of every attempt specifically so a user's bug report
+  // records which knobs were actually in effect — while still working everywhere else (HA entity,
+  // YAML, `make tuning-sync`). Table-driven means a new numeric knob can't repeat that: it either
+  // has a NUMBER_PARAMS row (and is covered) or it doesn't (and can't be set from HA at all).
+  for (const TuningNumberParam *p = tuning_number_params_begin(); p != tuning_number_params_end(); ++p) {
+    const float current = p->get(cfg);
+    if (current != p->get(DEFAULTS))
+      result += " " + std::string(p->name) + "=" + std::to_string(static_cast<int64_t>(current));
+  }
+
+  if (cfg.low_power_wake_belief != DEFAULTS.low_power_wake_belief)
+    result += " low_power_wake_belief=" + std::string(cfg.low_power_wake_belief ? "true" : "false");
+
+  if (cfg.pairing_discovery_commands != DEFAULTS.pairing_discovery_commands)
+    result += " pairing_discovery_commands=" + discovery_commands_to_string(cfg.pairing_discovery_commands);
+  // The default is auto; an explicit destination is the only non-default state worth emitting
+  // (the destination bytes are unused while auto is set).
+  if (!cfg.pairing_discovery_destination_auto) {
+    result +=
+        " pairing_discovery_destination=" + discovery_destination_to_string(cfg.pairing_discovery_destination_auto,
+                                                                            cfg.pairing_discovery_destination.data());
+  }
+  if (cfg.pairing_discovery_payload_enabled != DEFAULTS.pairing_discovery_payload_enabled ||
+      cfg.pairing_discovery_payload != DEFAULTS.pairing_discovery_payload) {
+    result += " pairing_discovery_payload=" +
+              discovery_payload_to_string(cfg.pairing_discovery_payload_enabled, cfg.pairing_discovery_payload);
+  }
+  if (cfg.pairing_discovery_low_power != DEFAULTS.pairing_discovery_low_power)
+    result += " pairing_discovery_low_power=" + std::string(cfg.pairing_discovery_low_power ? "true" : "false");
+  if (cfg.pairing_discovery_ack_capable != DEFAULTS.pairing_discovery_ack_capable)
+    result += " pairing_discovery_ack_capable=" + std::string(cfg.pairing_discovery_ack_capable ? "true" : "false");
+  // scan_power_classes is an enum, not a plain number, so it stays hand-written here like the
+  // three RX-bandwidth fields above (it's a SELECT_PARAMS row, not a NUMBER_PARAMS one).
+  if (cfg.scan_power_classes != DEFAULTS.scan_power_classes)
+    result += " scan_power_classes=" + scan_power_classes_to_string(cfg.scan_power_classes);
+  // pairing_discover_confirm is an enum, not a plain number, so it stays hand-written here like
+  // the two SELECT_PARAMS rows above; pairing_key_init_delay_ms is a plain NUMBER_PARAMS entry.
+  if (cfg.pairing_discover_confirm != DEFAULTS.pairing_discover_confirm)
+    result += " pairing_discover_confirm=" + discover_confirm_mode_to_string(cfg.pairing_discover_confirm);
+  // pairing_discovery_listen_channels is an enum SELECT_PARAMS row, same as the two above.
+  if (cfg.pairing_discovery_listen_channels != DEFAULTS.pairing_discovery_listen_channels) {
+    result += " pairing_discovery_listen_channels=" +
+              discovery_listen_channels_to_string(cfg.pairing_discovery_listen_channels);
+  }
+  // pairing_discovery_preamble, pairing_discovery_wait_ms, pairing_discovery_initial_dwell_ms,
+  // pairing_key_exchange_retries, and pairing_key_init_delay_ms are plain NUMBER_PARAMS entries —
+  // covered by the loop above.
+
+  return result;
+}
+
+std::string tuning_config_full_snapshot(const TuningConfig &cfg) {
+  const std::string result = tuning_config_snapshot(cfg);
+  if (result.empty())
+    return "Tuning: defaults active";
+  return "Tuning overrides active:" + result;
+}
+
+}  // namespace home_io_control
+}  // namespace esphome

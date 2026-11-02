@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 620" font-family="Helvetica, Arial, sans-serif">
+  <rect width="980" height="620" fill="#ffffff"/>
+  <text x="20" y="34" font-size="20" font-weight="bold" fill="#111">Shelly 2PM Gen3 — złącze programowania (7 pinów, 1.27 mm)</text>
+
+  <!-- ===================== SHELLY (złącze) ===================== -->
+  <rect x="30" y="90" width="330" height="420" rx="14" fill="#eaf3ea" stroke="#4a7d4a" stroke-width="2"/>
+  <text x="60" y="126" font-size="16" font-weight="bold" fill="#1b5e20">Płytka Shelly 2PM Gen3</text>
+  <text x="60" y="146" font-size="12" fill="#33691e">złącze serwisowe (interfejs add-on)</text>
+  <text x="60" y="161" font-size="12" fill="#33691e">dostępne po zdjęciu obudowy / w otworze</text>
+
+  <!-- 7 pinów -->
+  <g>
+    <rect x="70" y="200" width="26" height="26" rx="4" fill="#c8e6c9" stroke="#4a7d4a"/>
+    <rect x="70" y="240" width="26" height="26" rx="4" fill="#c8e6c9" stroke="#4a7d4a"/>
+    <rect x="70" y="280" width="26" height="26" rx="4" fill="#c8e6c9" stroke="#4a7d4a"/>
+    <rect x="70" y="320" width="26" height="26" rx="4" fill="#ffcdd2" stroke="#c62828" stroke-width="2"/>
+    <rect x="70" y="360" width="26" height="26" rx="4" fill="#c8e6c9" stroke="#4a7d4a"/>
+    <rect x="70" y="400" width="26" height="26" rx="4" fill="#fff59d" stroke="#f9a825" stroke-width="2"/>
+    <rect x="70" y="440" width="26" height="26" rx="4" fill="#bbdefb" stroke="#1565c0" stroke-width="2"/>
+  </g>
+  <text x="104" y="219" font-size="13" fill="#333">1 — ESP_DBG_UART <tspan fill="#888">(nie podłączać)</tspan></text>
+  <text x="104" y="259" font-size="13" fill="#333">2 — U0TXD <tspan fill="#888">→ RX adaptera</tspan></text>
+  <text x="104" y="299" font-size="13" fill="#333">3 — U0RXD <tspan fill="#888">→ TX adaptera</tspan></text>
+  <text x="104" y="339" font-size="13" font-weight="bold" fill="#c62828">4 — +3.3_ESP <tspan font-weight="normal" fill="#333">← 3.3 V adaptera</tspan></text>
+  <text x="104" y="379" font-size="13" fill="#333">5 — RESET <tspan fill="#888">(zwierać do GND = reset)</tspan></text>
+  <text x="104" y="419" font-size="13" font-weight="bold" fill="#7a5c00">6 — GPIO0 <tspan font-weight="normal" fill="#333">→ GND na czas flashowania (BOOT)</tspan></text>
+  <text x="104" y="459" font-size="13" font-weight="bold" fill="#1565c0">7 — GND <tspan font-weight="normal" fill="#333">← GND adaptera</tspan></text>
+  <text x="60" y="492" font-size="11" fill="#777">Numeracja wg rysunku interfejsu z bazy wiedzy Shelly („1” na płytce od strony pinu GND).</text>
+
+  <!-- ===================== ADAPTER USB-UART ===================== -->
+  <rect x="600" y="150" width="330" height="240" rx="14" fill="#f0f4ff" stroke="#3f51b5" stroke-width="2"/>
+  <text x="630" y="186" font-size="16" font-weight="bold" fill="#283593">Adapter USB-UART 3.3 V</text>
+  <text x="630" y="206" font-size="12" fill="#555">np. CP2102 / CH340 (zworka na 3.3 V!)</text>
+  <text x="630" y="236" font-size="13" fill="#333">3V3</text>
+  <text x="630" y="266" font-size="13" fill="#333">TX</text>
+  <text x="630" y="296" font-size="13" fill="#333">RX</text>
+  <text x="630" y="326" font-size="13" fill="#333">GND</text>
+  <g fill="#c5cae9" stroke="#3f51b5">
+    <rect x="586" y="226" width="22" height="18" rx="3"/>
+    <rect x="586" y="256" width="22" height="18" rx="3"/>
+    <rect x="586" y="286" width="22" height="18" rx="3"/>
+    <rect x="586" y="316" width="22" height="18" rx="3"/>
+  </g>
+
+  <!-- ===================== POŁĄCZENIA ===================== -->
+  <!-- 3.3V -->
+  <polyline points="96,333 470,333 470,235 586,235" fill="none" stroke="#c62828" stroke-width="2.5"/>
+  <!-- TX adaptera -> U0RXD (pin 3) -->
+  <polyline points="586,265 500,265 500,293 96,293" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+  <!-- RX adaptera <- U0TXD (pin 2) -->
+  <polyline points="586,295 540,295 540,253 96,253" fill="none" stroke="#2e7d32" stroke-width="2.5"/>
+  <!-- GND -->
+  <polyline points="586,325 430,325 430,453 96,453" fill="none" stroke="#1565c0" stroke-width="2.5"/>
+
+  <!-- GPIO0 -> GND (zworka BOOT) -->
+  <polyline points="96,413 60,413 60,540 500,540 500,453" fill="none" stroke="#f9a825" stroke-width="2.5" stroke-dasharray="7 4"/>
+  <circle cx="500" cy="453" r="4" fill="#1565c0"/>
+  <text x="140" y="536" font-size="12" fill="#7a5c00">zworka BOOT: GPIO0 → GND (w trakcie włączania zasilania i flashowania)</text>
+
+  <!-- RESET -->
+  <polyline points="96,373 40,373 40,570 620,570" fill="none" stroke="#9aa5b1" stroke-width="2.5" stroke-dasharray="7 4"/>
+  <text x="640" y="574" font-size="12" fill="#555">chwilowo do GND = reset</text>
+
+  <!-- ===================== UWAGI ===================== -->
+  <rect x="560" y="420" width="400" height="110" rx="10" fill="#fff3f3" stroke="#c62828"/>
+  <text x="580" y="448" font-size="14" font-weight="bold" fill="#b00020">UWAGA — bezpieczeństwo</text>
+  <text x="580" y="470" font-size="12" fill="#333">• Flashuj WYŁĄCZNIE bez podłączonego 230 V.</text>
+  <text x="580" y="488" font-size="12" fill="#333">• ESP zasilany z pinu +3.3_ESP (z adaptera).</text>
+  <text x="580" y="506" font-size="12" fill="#333">• Po flashowaniu odłącz przewody i dopiero wtedy podaj 230 V.</text>
+</svg>

@@ -53,6 +53,22 @@ Gate ──► 10k ──► GND (pull-down)
 GPIO3 ──► przycisk ──► GND
 ```
 
+## ESP32 DevKit V1 (klon, mostek CP2102): prędkość wgrywania
+
+- Przy domyślnych 921600 kbps wgrywanie wysypuje się na tej płytce: po zmianie
+  baud esptool zgłasza „The chip stopped responding” / `StopIteration` przy
+  `flash_id`. Chip jest rozpoznawany poprawnie (ESP32-D0WDQ6 rev v1.1), więc to
+  nie jest problem trybu downloadu — winna jest prędkość (i/lub kabel USB).
+- Działa 115200:
+  `arduino-cli compile -u -p /dev/cu.usbserial-XXXX \
+  --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=115200 .`
+  (1,37 MB, około 81 s).
+- Auto-reset przez DTR/RTS działa — nie trzeba trzymać BOOT. BOOT/EN przydaje
+  się dopiero, gdy esptool nie potrafi się połączyć („Timed out waiting for
+  packet header”).
+- macOS: port pojawia się jako `/dev/cu.usbserial-XXXX` bez instalowania
+  dodatkowych sterowników.
+
 ## Zasady montażu
 
 - **Wspólna masa** zasilacza 24 V + ESP + Source MOSFET (jeden punkt lutowniczy) — bez tego nic nie działa.

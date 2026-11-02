@@ -1,0 +1,568 @@
+#pragma once
+
+/// @file exchange_engine.h
+/// @brief Self-contained authenticated exchange engine for IO-Homecontrol 2W.
+/// @ingroup hioc_hub
+///
+/// ExchangeEngine encapsulates the outbound authenticated exchange state
+/// machine and the inbound challenge-response authentication path. It owns:
+///   - `send_and_receive()` — retry loop with challenge/response support.
+///   - `authenticate_request()` — verify a device-initiated command via HMAC.
+///   - `collect_broadcast_responses()` — send once, report every matching reply in a window.
+///   - Transmit with LBT (listen-before-talk) and frequency hopping.
+///   - Exchange debug snapshot captured on every attempt.
+///
+/// The engine holds double-pointer and raw-pointer references to its owner's
+/// state (radio driver, node/system key, tuning config) so that changes made
+/// by the hub after construction (e.g., radio driver allocation in setup(),
+/// direct member writes in unit tests) are automatically visible.
+///
+/// All transmit and channel-hop traffic funnels through this engine: the hub's
+/// thin `transmit_frame_()` / `hop_frequency_()` wrappers delegate here, and
+/// `PairingEngine` holds a direct reference for its own exchanges.
+
+#include "hub_exchange.h"
+#include "hub_decisions.h"
+#include "proto_frame.h"
+#include "proto_timing.h"
+#include "radio_interface.h"
+#include "transmit_observer.h"
+#include "tuning_config.h"
+
+#include <cstdint>
+#include <functional>
+#include <utility>
+
+namespace esphome {
+namespace home_io_control {
+
+/// @brief Authenticated exchange engine — outbound and inbound protocol flows.
+///
+/// All timing constants (retry count/delay, response windows) come from
+/// proto_timing.h; per-chip dwell overrides are queried from the RadioDriver.
+/// @brief What an outbound exchange actually achieved.
+///
+/// Deliberately not a bool: "the device accepted the command" and "the device told us what
+/// happened" are different facts, and some devices only ever deliver the first.
+///
+/// Some devices challenge a command, authenticate it, execute it, and then transmit nothing for
+/// several seconds — up to a dozen — reporting via an asynchronous status update later instead of
+/// closing the exchange with a synchronous reply, all well outside the exchange's own response
+/// window. Other devices on the same protocol close the exchange properly with a synchronous 0x04
+/// (see tests/corpus/captures/exchange/somfy_awning_exchange_open_sx1276.yaml), so the four-frame exchange
+/// is real — just not universal, and a caller cannot assume either shape from the command alone.
+///
+/// SUCCESS_UNCONFIRMED exists so that silence after a real authentication is not treated the same
+/// as a request the device may never have heard at all: the two need different retry rules (see
+/// decisions::retry_after_unconfirmed_accept_is_safe()) and different reporting to the caller.
+/// Silence is not always harmless, though: a device that got the request may still have missed our
+/// challenge answer and not acted, which is why a CMD_EXECUTE to a device that normally confirms is
+/// sent once more before this outcome is returned.
+enum class ExchangeOutcome : uint8_t {
+  FAILED,                 ///< No usable reply; the device may never have heard the request.
+  SUCCESS_WITH_RESPONSE,  ///< Device replied; the caller's `response` frame is populated.
+  SUCCESS_UNCONFIRMED,    ///< Device authenticated the request — so it received and accepted it —
+                          ///< but sent no final response. `response` is NOT populated. Callers that
+                          ///< need payload (key exchange) must treat this as failure; callers that
+                          ///< only need "the command landed" should treat it as success. For every
+                          ///< command but CMD_EXECUTE, this outcome is only returned after the full
+                          ///< retry budget is spent; a CMD_EXECUTE gets at most one re-send, and only
+                          ///< to a device that normally confirms — see
+                          ///< retry_after_unconfirmed_accept_is_safe().
+};
+
+class ExchangeEngine {
+ public:
+  /// Construct the engine with double-pointer indirection into the hub's
+  /// RadioDriver pointer and direct pointers to the node/key byte arrays and
+  /// the tuning config. Pointers must remain valid for the lifetime of the
+  /// engine (guaranteed because hub owns all referenced members).
+  /// @param radio_ptr   Address of the hub's `RadioDriver *radio_` member.
+  /// @param node_id     Pointer to the hub's `node_id_[NODE_ID_SIZE]` array.
+  /// @param system_key  Pointer to the hub's `system_key_[AES_KEY_SIZE]` array.
+  /// @param tuning      Pointer to the hub's `TuningConfig tuning_` member.
+  ExchangeEngine(RadioDriver **radio_ptr, const uint8_t *node_id, const uint8_t *system_key,
+                 const TuningConfig *tuning);
+
+  // Non-copyable; the hub owns exactly one engine tied to its member addresses.
+  ExchangeEngine(const ExchangeEngine &) = delete;
+  ExchangeEngine &operator=(const ExchangeEngine &) = delete;
+
+  // -------------------------------------------------------------------------
+  // Core exchange API
+  // -------------------------------------------------------------------------
+
+  /// Execute an outbound authenticated exchange with retry.
+  /// @param request  Frame to transmit (cmd + endpoints already filled).
+  /// @param response Populated only for @ref ExchangeOutcome::SUCCESS_WITH_RESPONSE.
+  /// @param freq     RF channel frequency (Hz).
+  /// @param max_tries Cap on transmit attempts for this exchange, clamped to
+  ///        [1, EXCHANGE_RETRY_COUNT]. Callers whose failure is already re-armed elsewhere (a
+  ///        scheduler-owned status poll) pass SCHEDULED_POLL_MAX_TRIES so a dead device does not
+  ///        block loop() for the full retry product.
+  /// @param request_preamble_override Preamble for the request frame in bytes, or 0 (the default) for
+  ///        request_preamble_for()'s rule. Only pairing passes a value: it sends its directed start
+  ///        frames with a preamble the device has just proven it hears (see
+  ///        PairingEngine::pairing_start_preamble_()). The 0x3D challenge response keeps the
+  ///        driver's response_preamble() either way. An override also switches the low-power wake
+  ///        belief off for that exchange: the caller has already chosen the preamble.
+  /// @return What the device actually told us — see @ref ExchangeOutcome.
+  ExchangeOutcome send_and_receive(const IoFrame &request, IoFrame &response, uint32_t freq,
+                                   uint8_t max_tries = EXCHANGE_RETRY_COUNT, uint16_t request_preamble_override = 0);
+
+  /// Authenticate an inbound device command via 0x3C challenge / 0x3D HMAC.
+  /// @param request The received inbound frame (e.g., CMD_STATUS_UPDATE).
+  /// @param freq    RF channel the frame arrived on.
+  /// @return true if HMAC verified; false on timeout or mismatch.
+  bool authenticate_request(const IoFrame &request, uint32_t freq);
+
+  /// @brief Per-reply facts collect_broadcast_responses() hands its caller alongside the frame.
+  ///
+  /// The engine owns the TX-complete instant and the received packet; the caller cannot
+  /// reconstruct either on its own (its own `millis()` taken before the call would include the
+  /// transmit itself — up to ~213 ms for a LONG_PREAMBLE start frame — and skew latency figures).
+  struct BroadcastReplyInfo {
+    int16_t rssi_dbm{0};      ///< RSSI of this reply (from the radio's last capture).
+    uint32_t rx_freq_hz{0};   ///< Channel the reply was received on (RadioRxPacket::freq_hz).
+    uint32_t after_tx_ms{0};  ///< Milliseconds from the request's transmit completing to this reply's delivery.
+  };
+
+  /// @brief Invoked for each matching broadcast reply, as it arrives.
+  /// @param frame Parsed reply frame (responder's address is `frame.src`).
+  /// @param info  RSSI, receive channel, and post-transmit latency for this reply.
+  using BroadcastReplyHandler = std::function<void(const IoFrame &frame, const BroadcastReplyInfo &info)>;
+
+  /// Transmit `request` once and hand every matching broadcast reply to `on_reply` within
+  /// `window_ms`.
+  ///
+  /// Unlike send_and_receive(), this neither retries the transmit nor performs any
+  /// authentication — a broadcast roll-call has no per-transaction proof, so replies are
+  /// informational only (see the caller's protocol notes). Every candidate packet is parsed
+  /// and checked against `expected_cmd` and `node_id_` (as the frame's destination); anything
+  /// that fails `parse()`, carries a different `cmd`, or is not addressed to us is ignored
+  /// without ending collection.
+  ///
+  /// `policy` selects which channels the listen covers, defaulting to
+  /// `ListenPolicy::ROTATE_SKIPPING_REQUEST` (measured: 1 of 149 Somfy always-alive roll-call
+  /// replies landed on the request channel — leaving it before the first listen costs almost
+  /// nothing). Pass `ListenPolicy::ROTATE_ALL_CHANNELS` for a roll-call whose responders can
+  /// reply on the request channel (real VELUX low-power `0x2B`s were observed there).
+  /// `ListenPolicy::HOLD_REQUEST_CHANNEL` is not a valid broadcast policy — a broadcast has no
+  /// pinned conversation to hold — and callers must not pass it; there is no runtime check for
+  /// this because the only non-default caller fixes its policy at compile time.
+  ///
+  /// This method stores nothing and imposes no capacity: it neither buffers replies nor
+  /// deduplicates them, so the same responder answering twice within one window invokes
+  /// `on_reply` twice. Storage, deduplication, and any capacity limit belong to the caller,
+  /// which knows how little of each reply it actually needs to keep — see
+  /// `ManagementActions::scan_paired_devices()`, which decodes each frame on arrival into a
+  /// compact record rather than retaining whole frames. Collection always runs to the deadline.
+  /// @param request       Frame to transmit once (cmd + endpoints already filled).
+  /// @param freq          RF channel frequency (Hz) for the initial transmit.
+  /// @param expected_cmd  Command byte a reply must carry to be considered.
+  /// @param window_ms     How long to listen after the transmit, in milliseconds. The caller
+  ///                      owns this budget explicitly (rather than this method reading
+  ///                      `tuning_->pairing_discovery_wait_ms` itself) because a caller that
+  ///                      transmits more than once needs to divide one total time budget across
+  ///                      several calls — see `ManagementActions::scan_paired_devices()`.
+  /// @param on_reply      Invoked once per matching reply, before the next packet is awaited, so
+  ///                      the handler must be cheap and must not block. Keep captures to a few
+  ///                      pointers: small callables avoid std::function's heap fallback on the
+  ///                      implementations this project builds against.
+  /// @param policy        Which channels to listen on; see above. Defaults to
+  ///                      `ListenPolicy::ROTATE_SKIPPING_REQUEST`.
+  /// @return Number of matching replies handed to `on_reply` (duplicates included).
+  uint8_t collect_broadcast_responses(const IoFrame &request, uint32_t freq, uint8_t expected_cmd, uint32_t window_ms,
+                                      const BroadcastReplyHandler &on_reply,
+                                      ListenPolicy policy = ListenPolicy::ROTATE_SKIPPING_REQUEST);
+
+  /// @brief The one listen primitive every radio wait loop in this project is built on.
+  ///
+  /// Listens for up to `spec.window_ms`, applying `spec.policy` (hold the current channel, rotate
+  /// all three, or rotate skipping the request channel), and hands every packet the radio
+  /// delivers to `on_frame` before deciding whether to keep waiting. See @ref ListenPolicy for the
+  /// measurements behind each policy and @ref ListenSpec for what each field controls.
+  ///
+  /// Parses each received packet into `frame`, so on ListenOutcome::ACCEPTED the caller's `frame`
+  /// already holds the accepted frame and `packet` already holds its raw bytes — no copy is
+  /// needed. A packet that fails to parse is still handed to `on_frame` (with a null `parsed`
+  /// pointer), so a caller that wants to log or count unparsable frames still can.
+  ///
+  /// Any richer result than accept/refuse/timeout — a disposition with more than three values, a
+  /// captured "did we see any traffic at all" flag — is the caller's business: capture it in
+  /// `on_frame`'s closure and return ACCEPT/IGNORE. `ListenOutcome` itself never grows a fourth
+  /// value; that is how a shared primitive would turn back into one loop per caller.
+  ///
+  /// @param spec    How this listen window is to be spent.
+  /// @param packet  Scratch space for the whole listen: holds the last received packet on
+  ///   return. On ACCEPTED that is the accepted packet; on ABORTED, the one `on_frame` refused;
+  ///   on TIMED_OUT, whatever arrived last (or the caller's initial value, if nothing did).
+  /// @param frame   Same lifetime as `packet`, parsed from it: holds the last received frame on
+  ///   return, with the same ACCEPTED/ABORTED/TIMED_OUT correspondence as `packet` above.
+  /// @param on_frame Invoked for every packet the radio delivers; decides whether to accept,
+  ///   abort, or keep listening. See @ref ReplyHandler.
+  /// @return ACCEPTED or ABORTED as `on_frame` decided, or TIMED_OUT if `spec.window_ms` elapsed
+  ///   first.
+  ListenOutcome listen(const ListenSpec &spec, RadioRxPacket &packet, IoFrame &frame, const ReplyHandler &on_frame);
+
+  // -------------------------------------------------------------------------
+  // Infrastructure delegated from the hub
+  // -------------------------------------------------------------------------
+
+  /// Transmit a raw IoFrame with the given preamble length, listening before talk on the TX
+  /// channel itself (the radio checks it inside send_packet(); see RadioTxConfig::cca_threshold_dbm).
+  /// @param frame    Frame to transmit.
+  /// @param freq     RF frequency in Hz.
+  /// @param preamble Preamble length in bytes (e.g. `LONG_PREAMBLE`, `SHORT_PREAMBLE`, or a
+  ///        tuning-configured value such as `normal_start_preamble`).
+  /// @return true if the radio accepted the packet; false otherwise.
+  bool transmit_frame(const IoFrame &frame, uint32_t freq, uint16_t preamble);
+
+  /// Preamble length for an outbound request frame. A non-start frame keeps the chip's short
+  /// response preamble. A start frame gets `LONG_PREAMBLE` only when it carries `CTRL1_LOW_POWER`
+  /// (its target is a duty-cycled receiver that must be woken); every other start frame gets the
+  /// runtime-tunable `normal_start_preamble`. For a directed frame, the target's per-device
+  /// `low_power` property sets the bit; for the roll-call broadcast, the pass being sent sets it (see
+  /// `ManagementActions::scan_paired_devices()`).
+  ///
+  /// This is the asleep / always-alive rule. `send_and_receive()` may pick a shorter preamble per
+  /// try for a low-power target it believes awake (see set_target_evidence_provider()), so the bit and
+  /// the preamble agree here but not necessarily on every try there; callers that send once, like
+  /// the discover-confirm step, always get the rule above.
+  ///
+  /// Public so any caller building its own start frame outside `send_and_receive()` — pairing's
+  /// discover-confirm step (0x2C) is one such caller — follows the same ADR 0029 rule instead of
+  /// re-implementing it next to a second copy.
+  /// @param request Frame the preamble is being chosen for.
+  /// @return Preamble length in bytes.
+  [[nodiscard]] uint16_t request_preamble_for(const IoFrame &request) const;
+
+  /// Send a 0x3D challenge response over `request`'s transcript, proving knowledge of the system
+  /// key to whoever sent `challenge`.
+  ///
+  /// The one place that builds and sends a 0x3D, so the 0x3D transcript rule (HMAC over the
+  /// challenged frame's cmd + data, create_challenge_resp()) and the response_preamble() choice
+  /// have exactly one owner, shared by the normal inbound-challenge path
+  /// (`handle_authentication_()`) and pairing's own post-0x32 challenge wait
+  /// (`PairingEngine::wait_for_key_confirm_()`). Does not touch `challenge_round_trips` —
+  /// callers that want it counted (handle_authentication_()) increment it themselves; the pairing
+  /// path deliberately does not, per that counter's own "no pairing path" doc.
+  /// @param request   The frame whose cmd+data the challenger wants proof of (the transcript).
+  /// @param challenge The inbound 0x3C carrying the challenge bytes in `challenge.data`.
+  /// @param freq      RF channel frequency (Hz) to transmit the 0x3D on.
+  /// @return true if the 0x3D was built and transmitted; false on a build or transmit failure.
+  bool answer_challenge(const IoFrame &request, const IoFrame &challenge, uint32_t freq);
+
+  /// @brief Advance the receiver one step along the protocol's channel rotation
+  ///   (CH1→CH2→CH3→CH1).
+  /// @param skip_freq Channel to pass over, or 0 to rotate through all three. Used by the
+  ///   always-alive roll-call pass (and discovery), whose replies almost never come back on the
+  ///   channel that asked; the low-power roll-call pass rotates through all three instead.
+  void hop_frequency(uint32_t skip_freq = 0);
+
+  /// Hop only if the minimum dwell has elapsed and no frame is currently arriving on this
+  /// channel — @ref RadioDriver::reception_in_progress() gates the hop so a reception in
+  /// progress is never destroyed mid-arrival (issue #81). A deferred hop does not reset the
+  /// dwell timer: it fires on the first call after the reception clears, not a further
+  /// HOP_TIME_US later.
+  /// Called from the hub's `loop()` to honour passive channel scanning.
+  void maybe_hop();
+
+  /// Reset the hop-timer (called after radio init in hub setup()).
+  void reset_hop_timestamp();
+
+  // -------------------------------------------------------------------------
+  // Transmit observer
+  // -------------------------------------------------------------------------
+
+  /// Attach the observer transmit_frame() reports LBT deferrals and sent frames to. One slot:
+  /// attaching replaces the previous observer. PairingEngine attaches its PairingTelemetry for
+  /// the duration of a `discover_and_pair()` attempt and detaches it afterwards; outside that,
+  /// the slot is empty and reporting is a no-op.
+  /// @param observer Non-owning pointer, or nullptr to detach.
+  void set_transmit_observer(TransmitObserver *observer) { this->transmit_observer_ = observer; }
+
+  // -------------------------------------------------------------------------
+  // Per-target evidence
+  // -------------------------------------------------------------------------
+
+  /// @brief Looks up what the hub knows about a destination node (decisions::TargetEvidence).
+  /// @param dst Destination node ID (NODE_ID_SIZE bytes) of the request being sent.
+  /// @param out Filled with that device's evidence when it is known.
+  /// @return false when the destination is not a registered device (no evidence to give).
+  using TargetEvidenceProvider = std::function<bool(const uint8_t *dst, decisions::TargetEvidence &out)>;
+
+  /// Install the source of per-target evidence. Installed once, when the hub is constructed. The
+  /// provider only looks evidence up; every decision drawn from it stays in the engine — the wake
+  /// belief (decisions::wake_belief(), gated by the `low_power_wake_belief` tuning switch) and the
+  /// re-send of an unconfirmed CMD_EXECUTE (decisions::retry_after_unconfirmed_accept_is_safe()), so
+  /// each decision lives in one place. With no provider installed every low-power exchange keeps
+  /// `LONG_PREAMBLE` on every try.
+  /// @param provider Evidence lookup, or an empty function to detach.
+  void set_target_evidence_provider(TargetEvidenceProvider provider) {
+    this->target_evidence_provider_ = std::move(provider);
+  }
+
+  /// @brief Forgets a destination's moving evidence.
+  /// @param dst Destination node ID (NODE_ID_SIZE bytes) of the request that went unanswered.
+  using WakeEvidenceSpentHandler = std::function<void(const uint8_t *dst)>;
+
+  /// Install what to do when an exchange planned on an `AWAKE` belief drew no frame at all: the
+  /// receiver did not answer the short preamble a moving one hears, nor the wake-up preamble, so the
+  /// belief that it is travelling is spent and the next exchange must lead with the wake-up preamble.
+  /// The engine decides when; the hub owns the device record and clears it. Installed once, next to
+  /// set_wake_evidence_provider().
+  /// @param handler Evidence reset, or an empty function to detach.
+  void set_wake_evidence_spent_handler(WakeEvidenceSpentHandler handler) {
+    this->wake_evidence_spent_handler_ = std::move(handler);
+  }
+
+  // -------------------------------------------------------------------------
+  // Exchange debug snapshot
+  // -------------------------------------------------------------------------
+
+  /// @brief Whether an exchange's start preamble followed the low-power wake belief, and if not,
+  /// why. Reported as the `belief=` field of the exchange-failure log line, so a posted log says
+  /// which of these applied instead of one ambiguous "not applied".
+  enum class WakeBeliefUse : uint8_t {
+    NOT_LOW_POWER,  ///< Not a low-power start frame: there is no wake-up preamble to reorder.
+    OVERRIDE,       ///< The caller forced a preamble (pairing's directed frames).
+    SWITCHED_OFF,   ///< The `low_power_wake_belief` tuning switch is off.
+    NO_PROVIDER,    ///< No evidence source installed (set_target_evidence_provider()).
+    APPLIED,        ///< The tries followed the belief in DebugInfo::wake_belief.
+  };
+
+  /// Log label for a WakeBeliefUse that is not APPLIED (an applied one logs the belief itself).
+  /// @param use Value to name.
+  /// @return "not_low_power", "override", "off", "no_provider" or "applied".
+  [[nodiscard]] static const char *wake_belief_use_name(WakeBeliefUse use);
+
+  /// @brief Snapshot of the last exchange attempt for diagnostics.
+  struct DebugInfo {
+    const char *stage{"idle"};                                         ///< Last recorded stage label.
+    uint8_t tries{0};                                                  ///< Retry count (1-based).
+    uint8_t max_tries{EXCHANGE_RETRY_COUNT};                           ///< Attempt cap this exchange was budgeted for.
+    WakeBeliefUse wake_belief_use{WakeBeliefUse::NOT_LOW_POWER};       ///< Whether the tries followed `wake_belief`,
+                                                                       ///< and why not if they did not.
+    decisions::WakeBelief wake_belief{decisions::WakeBelief::ASLEEP};  ///< Belief the tries followed; only
+                                                                       ///< meaningful when `wake_belief_use` is
+                                                                       ///< WakeBeliefUse::APPLIED.
+    uint16_t last_try_preamble{0};     ///< Preamble (bytes) of the most recent request transmit attempt, 0 = none.
+    uint8_t request_cmd{0};            ///< Command ID of the original request.
+    bool saw_challenge{false};         ///< True if a 0x3C was seen during this exchange.
+    bool capture_valid{false};         ///< True if radio capture is meaningful.
+    bool capture_rx_done{false};       ///< True if RxDone IRQ fired.
+    bool capture_crc_error{false};     ///< True if CRC error flagged; see RadioCaptureInfo::crc_error.
+    uint32_t capture_freq_hz{0};       ///< RF frequency of the captured packet.
+    uint16_t capture_irq_status{0};    ///< Raw IRQ register value.
+    uint8_t capture_packet_status{0};  ///< Chip packet-status byte.
+    uint8_t capture_reported_len{0};   ///< Length reported by radio packet engine.
+    uint8_t capture_frame_len{0};      ///< Parsed protocol frame length.
+    int16_t capture_rssi_dbm{0};       ///< RSSI of the captured packet (dBm).
+    // What the final-reply waits of this exchange heard, counted per event (see ListenStats). The
+    // capture fields above keep the *first* informative reception, which in an authenticated
+    // exchange is the device's challenge, so they cannot describe the wait for the final reply.
+    uint8_t final_waits{0};       ///< Final-reply waits run (one per try that got as far as our 0x3D).
+    uint8_t final_rx_ignored{0};  ///< Frames received during those waits and not accepted as the reply.
+    uint8_t final_rx_failed{0};   ///< Receptions started during those waits that could not be decoded.
+    uint16_t final_rx_irq{0};     ///< Radio IRQ status at the most recent of those failed receptions.
+  };
+
+  /// Clear the debug snapshot and record the upcoming request command.
+  void reset_debug(uint8_t request_cmd);
+
+  /// Update the debug snapshot with the current stage and radio capture.
+  void record_debug(const char *stage, uint8_t tries, bool saw_challenge);
+
+  /// Log the debug snapshot as a WARN-level structured line.
+  /// @param device_id Human-readable device identifier for the log line.
+  void log_debug(const char *device_id) const;
+
+  /// Log the debug snapshot for an exchange that ended accepted-but-unconfirmed, at INFO.
+  ///
+  /// Same fields as log_debug(), different prefix and level: the device challenged us, so this is
+  /// not a failure and must not read like one. It is logged at all because the snapshot is the
+  /// only evidence of what happened after our challenge answer went out — whether the radio saw
+  /// nothing (our answer likely never arrived, and the device never acted) or received something
+  /// it could not use (the device answered and this side lost the reply). Without it the whole
+  /// path is silent, and a field report has no way to tell those apart.
+  /// @param device_id Human-readable device identifier for the log line.
+  void log_debug_unconfirmed(const char *device_id) const;
+
+  /// Read-only access to the current debug snapshot.
+  [[nodiscard]] const DebugInfo &get_debug() const { return debug_; }
+
+  // -------------------------------------------------------------------------
+  // Exchange-engine counters
+  // -------------------------------------------------------------------------
+
+  /// @brief Free-running counters for the engine's own retry/parse behavior — not per-device (see
+  /// the RSSI/Exchange-Failures per-device sensors for that) and not per-attempt (see DebugInfo for
+  /// that). Persist until explicitly reset, so a caller can diff two snapshots across an arbitrary
+  /// window. Coverage differs per field, see each field's own comment below: `lbt_retries` is the
+  /// only one that covers pairing traffic too (pairing calls transmit_frame() the same way normal
+  /// exchanges do); the other three only observe ExchangeEngine's own send_and_receive() path.
+  ///
+  /// Internal-only, deliberately: nothing outside the unit tests reads counters() today — no HA
+  /// sensor, no log line, no periodic dump. Built to back a scripted continuous-operation
+  /// reliability test against dedicated bench hardware; that hardware was retired before the test
+  /// could run, so no consumer exists yet. Kept anyway (zero runtime cost, no YAML/schema surface,
+  /// already tested) as a cheap, ready primitive for whenever someone next needs to debug
+  /// exchange-level health — wiring it to a sensor or log line at that point is a small,
+  /// self-contained addition, not a redesign.
+  struct Counters {
+    uint32_t lbt_retries{0};            ///< transmit_frame() LBT backoff iterations (channel busy);
+                                        ///< covers pairing traffic too, via pairing_engine.cpp's
+                                        ///< own transmit_frame() calls.
+    uint32_t retransmits{0};            ///< send_and_receive() TX attempts beyond the first; no
+                                        ///< pairing path.
+    uint32_t challenge_round_trips{0};  ///< Completed 0x3C/0x3D challenge-response cycles, either
+                                        ///< direction: a device challenging our outbound command
+                                        ///< (handle_authentication_()) or us authenticating an
+                                        ///< inbound one (authenticate_request()); no pairing path.
+    uint32_t parse_failures{0};         ///< Frames wait_for_first_response_()/wait_for_final_response_()
+                                        ///< could not parse; does not count pairing_engine.cpp's own
+                                        ///< parse-null sites or collect_broadcast_responses()'s.
+  };
+
+  /// Read-only access to the running counters. No production caller yet — see the Counters
+  /// doc comment above.
+  [[nodiscard]] const Counters &counters() const { return this->counters_; }
+
+  /// Zero every counter (e.g. to start a fresh measurement window). No production caller yet —
+  /// see the Counters doc comment above.
+  void reset_counters() { this->counters_ = Counters{}; }
+
+ private:
+  // --- listen() helper -------------------------------------------------------
+
+  /// Retune per `skip` (see hop_frequency()) and fire `spec.on_hop` if set. Factored out of
+  /// listen() purely to keep that function's cognitive complexity under the clang-tidy
+  /// threshold — a member function call doesn't add to the caller's complexity the way an
+  /// inline lambda definition does.
+  /// @param skip Channel to pass over, or 0 to rotate through all three — see hop_frequency().
+  /// @param spec The listen this hop belongs to; only `on_hop` is read.
+  void listen_hop_(uint32_t skip, const ListenSpec &spec);
+
+  // --- Transmission shape and the exchange budget ---------------------------
+
+  /// The radio's estimate of how long transmitting `frame` on `freq` with `preamble` takes, in
+  /// whole milliseconds rounded up; 0 for a frame that does not serialize (it is never sent).
+  [[nodiscard]] uint32_t tx_time_ms_(const IoFrame &frame, uint32_t freq, uint16_t preamble) const;
+
+  /// The exchange budget rule: a try starts only if its transmission ends inside the budget.
+  /// @param elapsed_ms Time since the exchange began.
+  /// @param gap_ms     Wait before the try is sent.
+  /// @param tx_ms      The try's transmit time (tx_time_ms_()).
+  [[nodiscard]] bool try_fits_budget_(uint32_t elapsed_ms, uint32_t gap_ms, uint32_t tx_ms) const;
+
+  // --- Outbound exchange step helpers --------------------------------------
+
+  /// Transmit one request attempt and update context state on failure.
+  bool transmit_request_(const IoFrame &request, uint32_t freq, uint16_t preamble,
+                         exchange::OutboundExchangeContext &ctx);
+
+  /// Block until the first response arrives or the wait window expires.
+  decisions::ExchangeFirstResponseDisposition wait_for_first_response_(const IoFrame &request,
+                                                                       exchange::OutboundExchangeContext &ctx);
+
+  /// Send the 0x3D challenge response after receiving a 0x3C from the device.
+  bool handle_authentication_(const IoFrame &request, uint32_t freq, exchange::OutboundExchangeContext &ctx);
+
+  /// Block until the final authenticated response arrives or the window expires.
+  decisions::ExchangeFinalResponseDisposition wait_for_final_response_(const IoFrame &request,
+                                                                       exchange::OutboundExchangeContext &ctx);
+
+  /// Decide how many more tries follow a try that ended accepted without a closing reply. When
+  /// that repeats a CMD_EXECUTE, log it and wait out the part of UNCONFIRMED_EXECUTE_RESEND_DELAY_MS
+  /// that the loop's own retry gap does not cover. For a CMD_EXECUTE, looks the target up through the
+  /// evidence provider; then applies decisions::retry_after_unconfirmed_accept_is_safe().
+  /// @param request           Outbound request frame.
+  /// @param unconfirmed_tries Tries of this exchange so far that ended that way (1-based).
+  /// @param try_index         The try that just ended, for the log line.
+  /// @param elapsed_ms        Time since the exchange began.
+  /// @param next_tx_ms        The re-send's transmit time; a re-send whose transmission would not
+  ///                          end inside the exchange budget is not attempted (try_fits_budget_()).
+  /// @return 0 to end the exchange now; UNCONFIRMED_EXECUTE_MAX_RESENDS for a CMD_EXECUTE that is
+  ///         re-sent, which also caps the ordinary failure retries after it; EXCHANGE_RETRY_COUNT
+  ///         (no cap beyond the exchange's own) for any other request.
+  uint8_t tries_after_unconfirmed_(const IoFrame &request, uint8_t unconfirmed_tries, uint8_t try_index,
+                                   uint32_t elapsed_ms, uint32_t next_tx_ms);
+
+  /// Add one final-reply wait's ListenStats to the debug snapshot's `final_*` fields.
+  /// @param stats What that wait heard without accepting it.
+  void note_final_wait_(const ListenStats &stats);
+
+  /// @brief How the request's start preamble is chosen across one exchange's tries. Resolved once
+  /// per exchange by plan_request_preamble_(), then asked for each try.
+  struct PreamblePlan {
+    uint16_t fixed{0};                                ///< Every try, unless `use` is WakeBeliefUse::APPLIED.
+    WakeBeliefUse use{WakeBeliefUse::NOT_LOW_POWER};  ///< APPLIED: order the tries by `belief`.
+    decisions::WakeBelief belief{decisions::WakeBelief::ASLEEP};  ///< Only read when APPLIED.
+    uint16_t short_preamble{0};  ///< The moving receiver's preamble; only read when APPLIED.
+    uint16_t wake_preamble{0};   ///< The resting receiver's wake-up preamble; only read when APPLIED.
+    uint32_t last_seen_ms{0};    ///< When the target was last heard (`millis()`), for the per-try `age=` log
+                                 ///< field; 0 = never, or the evidence was not looked up (belief not APPLIED).
+
+    /// @param try_index 1-based try number.
+    /// @return Preamble in bytes for that try.
+    [[nodiscard]] uint16_t for_try(uint8_t try_index) const {
+      return use == WakeBeliefUse::APPLIED
+                 ? decisions::low_power_try_preamble(belief, try_index, short_preamble, wake_preamble)
+                 : fixed;
+    }
+  };
+
+  /// Decide how `request`'s start preamble is chosen across this exchange's tries. An explicit
+  /// override wins; a frame that is not a low-power start frame keeps request_preamble_for()'s rule;
+  /// a low-power start frame is ordered by the target's wake belief when the switch is on and a
+  /// provider is installed, whatever the exchange's try count. Consults the provider at most once,
+  /// so a belief is stable within an exchange.
+  /// @param request           Frame being sent.
+  /// @param override_preamble Caller-forced preamble in bytes, or 0 for none.
+  [[nodiscard]] PreamblePlan plan_request_preamble_(const IoFrame &request, uint16_t override_preamble) const;
+
+  /// Spends a device's moving evidence when an exchange planned on an `AWAKE` belief drew no frame at
+  /// all (see set_wake_evidence_spent_handler()). Called once, when the exchange has failed.
+  /// @param request The exchange's request frame (a STOP never spends the evidence).
+  /// @param plan    The preamble plan the exchange was sent with.
+  void spend_wake_evidence_if_silent_(const IoFrame &request, const PreamblePlan &plan);
+
+  // --- Dependencies (back-references into the hub) -------------------------
+
+  RadioDriver **radio_ptr_;                          ///< Double-pointer: *radio_ptr_ is always the hub's active driver.
+  const uint8_t *node_id_;                           ///< Hub's node_id_[NODE_ID_SIZE] array.
+  const uint8_t *system_key_;                        ///< Hub's system_key_[AES_KEY_SIZE] array.
+  const TuningConfig *tuning_;                       ///< Hub's live TuningConfig (read on every LBT check).
+  TransmitObserver *transmit_observer_{nullptr};     ///< Non-owning; see set_transmit_observer().
+  TargetEvidenceProvider target_evidence_provider_;  ///< See set_target_evidence_provider().
+  WakeEvidenceSpentHandler wake_evidence_spent_handler_;  ///< See set_wake_evidence_spent_handler().
+
+  // --- Engine state --------------------------------------------------------
+
+  uint32_t last_hop_us_{0};  ///< Timestamp of the last channel hop (µs, from micros()).
+  DebugInfo debug_{};        ///< Snapshot updated throughout each exchange attempt.
+  Counters counters_{};      ///< Free-running counters; see counters()/reset_counters().
+};
+
+/// Longest rendered exchange-debug field list, plus headroom for a long command name. Stays well
+/// under ESP-IDF's 512-byte log line together with the longest message prefix, so the trailing
+/// fields are never cut off on hardware.
+static constexpr size_t EXCHANGE_DEBUG_LINE_SIZE = 384;
+
+/// @brief Render the structured field list shared by both exchange-debug log lines.
+///
+/// Split out of the log calls so the rendering is testable on host: the test log macros discard
+/// their arguments, so a formatter that writes into a caller's buffer is the only shape whose
+/// output a test can assert on.
+///
+/// @param buf       Destination buffer, EXCHANGE_DEBUG_LINE_SIZE is always enough.
+/// @param buf_size  Size of `buf`.
+/// @param device_id Human-readable device identifier.
+/// @param d         Snapshot to render.
+/// @return snprintf()'s return value: the length the full line would have, so a caller (or a
+///         test) can detect truncation by comparing it against `buf_size`.
+int render_exchange_debug(char *buf, size_t buf_size, const char *device_id, const ExchangeEngine::DebugInfo &d);
+
+}  // namespace home_io_control
+}  // namespace esphome

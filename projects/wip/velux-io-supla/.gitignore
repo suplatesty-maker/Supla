@@ -1,0 +1,3 @@
+# Artefakty kompilacji (elf/map/merged bin - odtwarzalne po kompilacji)
+firmware/build/
+firmware/velux_io_supla/build/

@@ -1,0 +1,962 @@
+/// @file exchange_engine.cpp
+/// @brief Authenticated exchange engine — outbound and inbound protocol flows.
+/// @ingroup hioc_hub
+///
+/// Implements ExchangeEngine: the retry loop, challenge-response
+/// authentication, final-response wait, listen-before-talk transmit, and
+/// frequency-hopping. Debug-snapshot helpers are also here.
+
+#include "exchange_engine.h"
+
+#include "hub_decisions.h"
+#include "log_frame.h"
+#include "proto_commands.h"
+#include "proto_constants.h"
+#include "proto_crypto.h"
+#include "esphome/core/application.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+
+namespace esphome {
+namespace home_io_control {
+
+static const char *const TAG = "home_io_control.exchange";
+
+/// Microseconds per millisecond, for rounding a driver's transmit-time estimate up to whole ms.
+static constexpr uint32_t US_PER_MS = 1000;
+
+// ============================================================================
+// Construction
+// ============================================================================
+
+ExchangeEngine::ExchangeEngine(RadioDriver **radio_ptr, const uint8_t *node_id, const uint8_t *system_key,
+                               const TuningConfig *tuning)
+    : radio_ptr_(radio_ptr), node_id_(node_id), system_key_(system_key), tuning_(tuning) {}
+
+// ============================================================================
+// Debug snapshot helpers
+// ============================================================================
+
+void ExchangeEngine::reset_debug(uint8_t request_cmd) {
+  this->debug_ = DebugInfo{};
+  this->debug_.request_cmd = request_cmd;
+}
+
+void ExchangeEngine::note_final_wait_(const ListenStats &stats) {
+  DebugInfo &d = this->debug_;
+  const auto add = [](uint8_t &total, uint8_t n) {
+    total = static_cast<uint8_t>(std::min<unsigned>(total + n, UINT8_MAX));
+  };
+  add(d.final_waits, 1);
+  add(d.final_rx_ignored, stats.frames_ignored);
+  add(d.final_rx_failed, stats.failed_receptions);
+  if (stats.failed_receptions != 0)
+    d.final_rx_irq = stats.last_failed_irq;
+}
+
+void ExchangeEngine::record_debug(const char *stage, uint8_t tries, bool saw_challenge) {
+  this->debug_.stage = stage;
+  this->debug_.tries = tries;
+  this->debug_.saw_challenge = this->debug_.saw_challenge || saw_challenge;
+
+  const RadioCaptureInfo &capture = (*this->radio_ptr_)->get_last_capture();
+  // send_and_receive() blanks the radio capture at the start of each exchange (the path this
+  // snapshot mainly serves), so a valid capture here belongs to the current exchange rather than a
+  // previous one. wait_for_packet() re-clears the capture before each listen, so the *last*
+  // record_debug() call is always the final timed-out wait, which saw nothing. Keep the first
+  // informative capture instead: it distinguishes "the radio never detected a frame" from "it
+  // received one and this layer discarded it" — the question a failure report has to answer.
+  // Known gap: record_debug() calls outside that blanking — the bare ones in pairing_engine.cpp,
+  // authenticate_request(), and collect_broadcast_responses()'s "broadcast_tx_failed" branch — can
+  // still carry a capture from before their flow began. None of those snapshots reaches log_debug().
+  if (!capture.valid && this->debug_.capture_valid)
+    return;
+  this->debug_.capture_valid = capture.valid;
+  this->debug_.capture_rx_done = capture.rx_done;
+  this->debug_.capture_crc_error = capture.crc_error;
+  this->debug_.capture_freq_hz = capture.freq_hz;
+  this->debug_.capture_irq_status = capture.irq_status;
+  this->debug_.capture_packet_status = capture.packet_status;
+  this->debug_.capture_reported_len = capture.reported_len;
+  this->debug_.capture_frame_len = capture.frame_len;
+  this->debug_.capture_rssi_dbm = capture.rssi_dbm;
+}
+
+int render_exchange_debug(char *buf, size_t buf_size, const char *device_id, const ExchangeEngine::DebugInfo &d) {
+  return snprintf(buf, buf_size,
+                  "device=%s cmd=%s(0x%02X) stage=%s tries=%u max_tries=%u saw_challenge=%u cap_valid=%u "
+                  "cap_rx_done=%u cap_crc_err=%u cap_freq=%" PRIu32
+                  " cap_irq=0x%04X cap_pkt=0x%02X cap_reported_len=%u cap_frame_len=%u cap_rssi=%d belief=%s "
+                  "last_preamble=%u final_waits=%u final_rx_ignored=%u final_rx_failed=%u final_rx_irq=0x%04X",
+                  device_id, command_name(d.request_cmd), d.request_cmd, d.stage, d.tries, d.max_tries,
+                  // Rendered as 0/1: these are flags in a field list, not prose, and a caller greps them.
+                  static_cast<unsigned>(d.saw_challenge), static_cast<unsigned>(d.capture_valid),
+                  static_cast<unsigned>(d.capture_rx_done), static_cast<unsigned>(d.capture_crc_error),
+                  d.capture_freq_hz, d.capture_irq_status, d.capture_packet_status, d.capture_reported_len,
+                  d.capture_frame_len, d.capture_rssi_dbm,
+                  d.wake_belief_use == ExchangeEngine::WakeBeliefUse::APPLIED
+                      ? decisions::wake_belief_name(d.wake_belief)
+                      : ExchangeEngine::wake_belief_use_name(d.wake_belief_use),
+                  d.last_try_preamble, d.final_waits, d.final_rx_ignored, d.final_rx_failed, d.final_rx_irq);
+}
+
+void ExchangeEngine::log_debug(const char *device_id) const {
+  char fields[EXCHANGE_DEBUG_LINE_SIZE];
+  render_exchange_debug(fields, sizeof(fields), device_id, this->debug_);
+  ESP_LOGW(TAG, "Exchange failed: %s", fields);
+}
+
+void ExchangeEngine::log_debug_unconfirmed(const char *device_id) const {
+  char fields[EXCHANGE_DEBUG_LINE_SIZE];
+  render_exchange_debug(fields, sizeof(fields), device_id, this->debug_);
+  // "accepted" describes what the device did with the request, not what it did with our challenge
+  // answer — see the WAIT_FINAL_RESPONSE branch in send_and_receive() for why silence here has two
+  // possible causes. The final_rx_* fields are what tells them apart: a reception during the final
+  // wait means something came back and was lost here. The cap_* fields cannot, because they keep
+  // the first informative reception, which is the device's challenge.
+  ESP_LOGI(TAG, "Exchange accepted without a closing reply: %s", fields);
+}
+
+// ============================================================================
+// Frequency hopping
+// ============================================================================
+
+void ExchangeEngine::reset_hop_timestamp() { this->last_hop_us_ = micros(); }
+
+void ExchangeEngine::hop_frequency(uint32_t skip_freq) {
+  RadioDriver *radio = *this->radio_ptr_;
+  uint32_t next = radio->get_current_freq();
+  // At most two iterations: the rotation cycles through all three channels and only one of them
+  // can be skipped, so a channel that is not skip_freq is always one or two steps away.
+  do {
+    switch (next) {
+      case FREQ_CH1:
+        next = FREQ_CH2;
+        break;
+      case FREQ_CH3:
+        next = FREQ_CH1;
+        break;
+      default:
+        next = FREQ_CH3;
+        break;
+    }
+  } while (next == skip_freq);
+  radio->change_frequency(next);
+  this->last_hop_us_ = micros();
+}
+
+void ExchangeEngine::maybe_hop() {
+  if ((micros() - this->last_hop_us_) <= HOP_TIME_US)
+    return;
+  // A frame arriving on this channel outranks the dwell timer: change_frequency() retunes under a
+  // running demodulator and, on the software-PHY chips, also clears the IRQ word and the DIO
+  // latch, so hopping here destroys the frame rather than deferring it (issue #81).
+  // last_hop_us_ is deliberately left alone: the dwell has already been served, so the hop should
+  // happen on the very next pass once the reception clears, not a further HOP_TIME_US later.
+  if ((*this->radio_ptr_)->reception_in_progress())
+    return;
+  this->hop_frequency();
+}
+
+// ============================================================================
+// Transmit with LBT
+// ============================================================================
+
+namespace {
+
+/// The RadioTxConfig for `frame` on `freq` with `preamble`: the one place a transmission's shape
+/// (channel, preamble, wake-up level) is decided, for transmit_frame() and for the budget estimate.
+RadioTxConfig tx_config_for(const IoFrame &frame, uint32_t freq, uint16_t preamble) {
+  RadioTxConfig tx_config{};
+  tx_config.freq_hz = freq;
+  tx_config.preamble_len = preamble;
+  tx_config.wake = tx_wake_for(is_start(frame), preamble);
+  return tx_config;
+}
+
+}  // namespace
+
+bool ExchangeEngine::transmit_frame(const IoFrame &frame, uint32_t freq, uint16_t preamble) {
+  RadioDriver *radio = *this->radio_ptr_;
+  // FRAME_MAX_WIRE_SIZE, not FRAME_MAX_SIZE: a frame with an out-of-length MAC trailer
+  // (IoFrame::has_mac, e.g. CMD_ONEWAY_ADD_CONTROLLER) serializes to more than
+  // FRAME_MAX_SIZE/FRAME_MAX_DECLARED_SIZE bytes, and serialize() rejects a buffer too small to
+  // hold its actual output rather than truncating into it.
+  uint8_t buf[FRAME_MAX_WIRE_SIZE];
+  uint8_t const len = serialize(frame, buf, sizeof(buf));
+  if (len == 0) {
+    ESP_LOGW(TAG, "tx: serialize_failed cmd=0x%02X", frame.cmd);
+    return false;
+  }
+  // Listen before talk: up to lbt_max_retries sends that the radio makes only if the TX channel is
+  // clear, measured by the driver on that channel right before transmitting; after the last busy
+  // result, one send without the check, so a noisy channel delays a frame but never drops it.
+  RadioTxConfig tx_config = tx_config_for(frame, freq, preamble);
+  TxResult result;
+  for (uint8_t lbt = 0;; lbt++) {
+    if (lbt < this->tuning_->lbt_max_retries) {
+      tx_config.cca_threshold_dbm = this->tuning_->lbt_rssi_threshold_dbm;
+    } else {
+      tx_config.cca_threshold_dbm.reset();
+    }
+    result = radio->send_packet(buf, len, tx_config);
+    if (result.status != TxResult::Status::CHANNEL_BUSY)
+      break;
+    ESP_LOGD(TAG, "LBT: channel busy (RSSI %d dBm on %" PRIu32 " Hz), retry %u/%u", result.cca_level_dbm, freq, lbt + 1,
+             this->tuning_->lbt_max_retries);
+    this->counters_.lbt_retries++;
+    if (this->transmit_observer_ != nullptr)
+      this->transmit_observer_->on_lbt_defer(result.cca_level_dbm);
+    delay(LBT_RETRY_DELAY_MS);
+  }
+  if (!result.sent()) {
+    ESP_LOGW(TAG, "tx: send_failed cmd=0x%02X", frame.cmd);
+    return false;
+  }
+  if (this->transmit_observer_ != nullptr)
+    this->transmit_observer_->on_transmit(frame, tx_config, len);
+  return true;
+}
+
+uint32_t ExchangeEngine::tx_time_ms_(const IoFrame &frame, uint32_t freq, uint16_t preamble) const {
+  uint8_t buf[FRAME_MAX_WIRE_SIZE];
+  uint8_t const len = serialize(frame, buf, sizeof(buf));
+  if (len == 0)
+    return 0;
+  uint32_t const tx_us = (*this->radio_ptr_)->tx_air_time_us(len, tx_config_for(frame, freq, preamble));
+  return (tx_us + US_PER_MS - 1) / US_PER_MS;
+}
+
+bool ExchangeEngine::try_fits_budget_(uint32_t elapsed_ms, uint32_t gap_ms, uint32_t tx_ms) const {
+  return elapsed_ms + gap_ms + tx_ms < this->tuning_->exchange_total_budget_ms;
+}
+
+// ============================================================================
+// Outbound exchange — main entry point
+// ============================================================================
+
+namespace {
+
+/// @brief Map OutboundExchangeState to a short string for debug logging.
+///
+/// OutboundExchangeState is written at each step for debug capture but is
+/// never read back for control-flow decisions — all branching is driven by
+/// return values and disposition enums.
+const char *outbound_stage_name(exchange::OutboundExchangeState state) {
+  switch (state) {
+    case exchange::OutboundExchangeState::IDLE:
+      return "idle";
+    case exchange::OutboundExchangeState::TX_REQUEST:
+      return "tx_request";
+    case exchange::OutboundExchangeState::WAIT_FIRST_RESPONSE:
+      return "wait_first_response";
+    case exchange::OutboundExchangeState::BUILD_AUTH_RESPONSE:
+      return "build_auth_response";
+    case exchange::OutboundExchangeState::TX_AUTH_RESPONSE:
+      return "tx_auth_response";
+    case exchange::OutboundExchangeState::WAIT_FINAL_RESPONSE:
+      return "wait_final_response";
+    case exchange::OutboundExchangeState::SUCCESS:
+      return "success";
+    case exchange::OutboundExchangeState::FAILED:
+    default:
+      return "failed";
+  }
+}
+
+/// @brief Map InboundAuthState to a short string for debug logging.
+const char *inbound_stage_name(exchange::InboundAuthState state) {
+  switch (state) {
+    case exchange::InboundAuthState::IDLE:
+      return "idle";
+    case exchange::InboundAuthState::TX_CHALLENGE:
+      return "tx_challenge";
+    case exchange::InboundAuthState::WAIT_CHALLENGE_RESPONSE:
+      return "wait_challenge_response";
+    case exchange::InboundAuthState::VERIFIED:
+      return "verified";
+    case exchange::InboundAuthState::FAILED:
+    default:
+      return "failed";
+  }
+}
+
+/// Check if frame is a 0x3D challenge response.
+bool frame_is_challenge_response(const IoFrame &frame) { return frame.cmd == CMD_CHALLENGE_RESP; }
+
+/// Log a frame that arrived but could not be parsed. Printing it distinguishes "the radio heard
+/// nothing" from "we heard something and rejected it" in a failure report — the two need opposite
+/// fixes: a device that never transmitted needs a longer wait or a link check, while one that
+/// transmits noise this layer can't decode needs the RX bandwidth or framing looked at. Redacted
+/// through the same helper as every other frame log, so an unparsable frame can't leak key material
+/// by being unrecognisable (see ADR 0011).
+void log_unparsable_frame(const char *stage, int tries, const RadioRxPacket &packet) {
+  // The *fact* that a frame failed to parse stays unconditional — it is a real fault worth
+  // surfacing to someone who never enables a debug flag. The raw bytes only help someone already
+  // debugging the PHY, and a noisy channel can produce several of these a minute, so they sit
+  // behind the frame-log flag with the rest of that detail.
+  ESP_LOGW(TAG, "%s try=%d: %u bytes did not parse as a frame on %" PRIu32 " Hz", stage, tries, packet.len,
+           packet.freq_hz);
+#ifdef IOHOME_FRAME_LOG
+  char hex[FRAME_LOG_HEX_BUFFER_SIZE];
+  render_frame_hex_redacted(packet.data, packet.len, hex, sizeof(hex));
+  ESP_LOGD(TAG, "  raw: %s", hex);
+#endif
+}
+
+/// Log an exchanged frame with context (stage, try index, length).
+void log_exchange_frame(const char *stage, int tries, const IoFrame &frame, uint8_t len) {
+  ESP_LOGD(TAG, "%s try=%d cmd=0x%02X src=%02X%02X%02X dst=%02X%02X%02X len=%u", stage, tries, frame.cmd, frame.src[0],
+           frame.src[1], frame.src[2], frame.dst[0], frame.dst[1], frame.dst[2], len);
+}
+
+/// Buffer for format_try_age(): "n/a", or a uint32_t's ten decimal digits, plus the terminator.
+constexpr size_t TRY_AGE_BUFFER_SIZE = 12;
+
+/// Render a try's `age_ms=` field: how long before this try the target was last heard, or "n/a"
+/// when there is no stamp (never heard, or the target evidence was not looked up). Every try line
+/// carries it next to the try's preamble, so field logs show which preamble reaches a low-power
+/// receiver how long after it last spoke — the data the wake-belief windows are sized from. The
+/// stamp is read once, before the exchange, so a challenge heard on an earlier try of the same
+/// exchange does not reset it.
+void format_try_age(const exchange::OutboundExchangeContext &ctx, char (&buf)[TRY_AGE_BUFFER_SIZE]) {
+  if (ctx.target_last_seen_ms == 0) {
+    snprintf(buf, sizeof(buf), "n/a");
+    return;
+  }
+  snprintf(buf, sizeof(buf), "%" PRIu32, ctx.try_start_ms - ctx.target_last_seen_ms);
+}
+
+/// True for a start frame addressed to a duty-cycled receiver — the only frame that has a wake-up
+/// preamble to choose. One definition, shared by the fixed rule and the per-try wake belief.
+bool is_low_power_start(const IoFrame &request) { return is_start(request) && (request.ctrl1 & CTRL1_LOW_POWER) != 0; }
+
+/// Determine if a candidate frame is a valid final response for the request.
+bool is_valid_final_response(const IoFrame &candidate, const IoFrame &request) {
+  return decisions::classify_exchange_final_response(request, candidate) ==
+         decisions::ExchangeFinalResponseDisposition::ACCEPT;
+}
+
+}  // namespace
+
+ExchangeOutcome ExchangeEngine::send_and_receive(const IoFrame &request, IoFrame &response, uint32_t freq,
+                                                 uint8_t max_tries, uint16_t request_preamble_override) {
+  this->reset_debug(request.cmd);
+  // Blank the radio's diagnostic capture at the start of the exchange. The radio only clears it
+  // when it actually begins a listen, so an exchange that transmits and then hears nothing at all
+  // would otherwise inherit the *previous* exchange's capture and claim "we heard a frame" when
+  // nothing was on air. Done here rather than in reset_debug() because collect_broadcast_responses()
+  // shares that helper but does not need this: its only capture reader runs per delivered reply
+  // (with the listen repopulating the capture first), and its DebugInfo is never passed to log_debug().
+  (*this->radio_ptr_)->clear_last_capture();
+  // Clamp once: never below 1 (a caller passing 0 must not silently transmit nothing) and never
+  // above EXCHANGE_RETRY_COUNT (the budget check downstream assumes that ceiling).
+  uint8_t tries_allowed = std::max<uint8_t>(1, std::min<uint8_t>(max_tries, EXCHANGE_RETRY_COUNT));
+  this->debug_.max_tries = tries_allowed;
+  const PreamblePlan preamble_plan = this->plan_request_preamble_(request, request_preamble_override);
+  this->debug_.wake_belief_use = preamble_plan.use;
+  if (preamble_plan.use == WakeBeliefUse::APPLIED) {
+    this->debug_.wake_belief = preamble_plan.belief;
+    if (preamble_plan.belief == decisions::WakeBelief::AWAKE) {
+      ESP_LOGD(TAG, "Low-power target %s believed %s: short preamble first", node_id_to_string(request.dst).c_str(),
+               decisions::wake_belief_name(preamble_plan.belief));
+    }
+  }
+  const uint32_t exchange_begin_ms = millis();
+  uint8_t unconfirmed_tries = 0;  // tries that ended challenged but never closed
+
+  for (uint8_t tries = 0; tries < tries_allowed; tries++) {
+    exchange::OutboundExchangeContext context;
+    context.try_index = tries + 1;
+    context.wait_ms =
+        is_start(request) ? this->tuning_->exchange_start_response_wait_ms : this->tuning_->exchange_response_wait_ms;
+    context.state = exchange::OutboundExchangeState::TX_REQUEST;
+
+    if (tries > 0) {
+      // The retry count is a maximum, not a promise: don't start a try whose transmission would
+      // end past the budget. See EXCHANGE_TOTAL_BUDGET_MS -- this is what keeps a failing command
+      // from blocking the ESPHome loop for the full retries x (transmission + response window)
+      // product.
+      if (!this->try_fits_budget_(millis() - exchange_begin_ms, EXCHANGE_RETRY_DELAY_MS,
+                                  this->tx_time_ms_(request, freq, preamble_plan.for_try(context.try_index)))) {
+        this->record_debug("retry_budget_exhausted", tries, false);
+        ESP_LOGI(TAG, "Exchange budget exhausted after %u tries for cmd=%s(0x%02X) (%" PRIu32 " of %u ms)", tries,
+                 command_name(request.cmd), request.cmd, millis() - exchange_begin_ms,
+                 this->tuning_->exchange_total_budget_ms);
+        break;
+      }
+      App.feed_wdt();
+      delay(EXCHANGE_RETRY_DELAY_MS);
+      this->counters_.retransmits++;
+    }
+
+    // Stamped after the retry gap, so a try's wait_ms and age_ms measure from its own transmit and
+    // not from the end of the previous try.
+    context.try_start_ms = millis();
+    context.request_preamble = preamble_plan.for_try(context.try_index);
+    context.target_last_seen_ms = preamble_plan.last_seen_ms;
+    this->debug_.last_try_preamble = context.request_preamble;
+    if (!this->transmit_request_(request, freq, context.request_preamble, context))
+      continue;
+
+    context.state = exchange::OutboundExchangeState::WAIT_FIRST_RESPONSE;
+    this->record_debug(outbound_stage_name(context.state), context.try_index, false);
+    auto first_disp = this->wait_for_first_response_(request, context);
+    if (first_disp == decisions::ExchangeFirstResponseDisposition::IGNORE_UNRELATED)
+      continue;
+    if (first_disp == decisions::ExchangeFirstResponseDisposition::COMPLETE_DIRECT) {
+      context.state = exchange::OutboundExchangeState::SUCCESS;
+      this->record_debug("success_direct", context.try_index, false);
+      // The hit counterpart of "Try N ended": an unauthenticated reply (a status poll's answer)
+      // prints no challenge line, so without this a log would only ever show which preambles missed.
+      char age[TRY_AGE_BUFFER_SIZE];
+      format_try_age(context, age);
+      ESP_LOGI(TAG, "Try %d answered: cmd=%s(0x%02X) wait_ms=%" PRIu32 " preamble=%u age_ms=%s", context.try_index,
+               command_name(request.cmd), request.cmd, context.first_response_ms - context.try_start_ms,
+               context.request_preamble, age);
+      response = context.rx;
+      return ExchangeOutcome::SUCCESS_WITH_RESPONSE;
+    }
+
+    if (!this->handle_authentication_(request, freq, context))
+      continue;
+
+    context.state = exchange::OutboundExchangeState::WAIT_FINAL_RESPONSE;
+    this->record_debug(outbound_stage_name(context.state), context.try_index, true);
+    auto final_disp = this->wait_for_final_response_(request, context);
+    if (final_disp != decisions::ExchangeFinalResponseDisposition::ACCEPT) {
+      // The device challenged us, so it demonstrably received the request. It does not follow that
+      // it acted on it: a challenge says nothing about whether our 0x3D answer arrived and
+      // verified, and a device that never got that answer never executes. Silence here therefore
+      // has two causes that look identical from this side — our answer was lost, or the device
+      // replied and this side lost the reply — on top of the devices that simply never close an
+      // exchange with a synchronous reply (see ExchangeOutcome). log_debug_unconfirmed()'s final_rx_*
+      // fields are what separates them after the fact: a reception during the final wait means a
+      // reply came back and was lost on this side.
+      // How many more tries to spend is tries_after_unconfirmed_(): a CMD_EXECUTE may already be
+      // acting on this copy, so it is repeated only where that is harmless and the silence is an
+      // anomaly, and then only once; everything else keeps its full retry budget.
+      context.state = exchange::OutboundExchangeState::SUCCESS;
+      this->record_debug("success_auth_unconfirmed", context.try_index, true);
+      unconfirmed_tries++;
+      const uint8_t further_tries = this->tries_after_unconfirmed_(
+          request, unconfirmed_tries, context.try_index, millis() - exchange_begin_ms,
+          this->tx_time_ms_(request, freq, preamble_plan.for_try(context.try_index + 1)));
+      if (further_tries == 0)
+        return ExchangeOutcome::SUCCESS_UNCONFIRMED;
+      tries_allowed = std::min<uint8_t>(tries_allowed, tries + 1 + further_tries);
+      continue;
+    }
+
+    context.state = exchange::OutboundExchangeState::SUCCESS;
+    this->record_debug("success_auth", context.try_index, true);
+    response = context.rx;
+    return ExchangeOutcome::SUCCESS_WITH_RESPONSE;
+  }
+
+  // An exchange that authenticated on some try but never got a reply is not the same as one the
+  // device never answered at all: callers that only need "the request landed" can act on it, and
+  // callers that need the payload still cannot.
+  if (unconfirmed_tries > 0)
+    return ExchangeOutcome::SUCCESS_UNCONFIRMED;
+  this->spend_wake_evidence_if_silent_(request, preamble_plan);
+  return ExchangeOutcome::FAILED;
+}
+
+void ExchangeEngine::spend_wake_evidence_if_silent_(const IoFrame &request, const PreamblePlan &plan) {
+  // Believed moving, yet silent to the short preamble a moving receiver hears and to the wake-up
+  // preamble alike: it has most likely come to rest. Spend the moving evidence so the next exchange
+  // leads with the wake-up preamble instead of losing its first try (or, for a single-try poll, its
+  // only one) to the short preamble again. A challenge means it heard us, so that keeps the evidence.
+  // So does a silent STOP: nothing was stopped, and the receiver may well still be travelling.
+  if (plan.use == WakeBeliefUse::APPLIED && plan.belief == decisions::WakeBelief::AWAKE &&
+      !this->debug_.saw_challenge && !decisions::is_stop_request(request) && this->wake_evidence_spent_handler_) {
+    ESP_LOGD(TAG, "Low-power target %s silent while believed awake: next exchange leads with the wake-up preamble",
+             node_id_to_string(request.dst).c_str());
+    this->wake_evidence_spent_handler_(request.dst);
+  }
+}
+
+// ============================================================================
+// Outbound exchange step helpers
+// ============================================================================
+
+uint16_t ExchangeEngine::request_preamble_for(const IoFrame &request) const {
+  // Gate on the start flag first: several device-role / continuation builders (key transfer,
+  // status-update response) set CTRL1_LOW_POWER on a non-start frame, and those must keep the
+  // short response preamble, not be lengthened.
+  if (!is_start(request))
+    return (*this->radio_ptr_)->response_preamble();
+  return is_low_power_start(request) ? this->tuning_->low_power_wake_preamble : this->tuning_->normal_start_preamble;
+}
+
+const char *ExchangeEngine::wake_belief_use_name(WakeBeliefUse use) {
+  switch (use) {
+    case WakeBeliefUse::OVERRIDE:
+      return "override";
+    case WakeBeliefUse::SWITCHED_OFF:
+      return "off";
+    case WakeBeliefUse::NO_PROVIDER:
+      return "no_provider";
+    case WakeBeliefUse::APPLIED:
+      return "applied";
+    case WakeBeliefUse::NOT_LOW_POWER:
+    default:
+      return "not_low_power";
+  }
+}
+
+ExchangeEngine::PreamblePlan ExchangeEngine::plan_request_preamble_(const IoFrame &request,
+                                                                    uint16_t override_preamble) const {
+  PreamblePlan plan;
+  plan.fixed = override_preamble != 0 ? override_preamble : this->request_preamble_for(request);
+  // Every reason not to apply the belief keeps the fixed preamble and is recorded, so the
+  // exchange-failure log names it. The override is the caller's explicit choice (pairing), so it
+  // is never second-guessed. Only a low-power *start* frame has a wake-up preamble to reorder.
+  // The try count is deliberately not a reason: a single-try exchange (most scheduler-owned status
+  // polls) follows the belief's first try like any other. Its likeliest moment is the settle poll
+  // seconds after a command or STOP, when the receiver is travelling or has just answered — the
+  // state in which a moving VELUX solar receiver ignores the wake-up preamble — so a fixed wake-up
+  // preamble there loses the poll and a backoff slot instead of guarding against anything.
+  if (override_preamble != 0) {
+    plan.use = WakeBeliefUse::OVERRIDE;
+  } else if (!is_low_power_start(request)) {
+    plan.use = WakeBeliefUse::NOT_LOW_POWER;
+  } else if (!this->tuning_->low_power_wake_belief) {
+    plan.use = WakeBeliefUse::SWITCHED_OFF;
+  } else if (!this->target_evidence_provider_) {
+    plan.use = WakeBeliefUse::NO_PROVIDER;
+  } else {
+    plan.use = WakeBeliefUse::APPLIED;
+  }
+  if (plan.use != WakeBeliefUse::APPLIED)
+    return plan;
+
+  // A destination the hub has no record of has no evidence: treat it as asleep, the safe default.
+  decisions::TargetEvidence evidence{};
+  const bool known = this->target_evidence_provider_(request.dst, evidence);
+  plan.short_preamble = this->tuning_->normal_start_preamble;
+  plan.wake_preamble = this->tuning_->low_power_wake_preamble;
+  plan.last_seen_ms = known ? evidence.last_seen_ms : 0;
+  plan.belief = known ? decisions::wake_belief(evidence, millis(), decisions::is_stop_request(request))
+                      : decisions::WakeBelief::ASLEEP;
+  return plan;
+}
+
+bool ExchangeEngine::transmit_request_(const IoFrame &request, uint32_t freq, uint16_t preamble,
+                                       exchange::OutboundExchangeContext &ctx) {
+  if (!this->transmit_frame(request, freq, preamble)) {
+    ctx.state = exchange::OutboundExchangeState::FAILED;
+    this->record_debug("tx_request_failed", ctx.try_index, false);
+    return false;
+  }
+  return true;
+}
+
+decisions::ExchangeFirstResponseDisposition ExchangeEngine::wait_for_first_response_(
+    const IoFrame &request, exchange::OutboundExchangeContext &ctx) {
+  ListenSpec spec;
+  spec.window_ms = ctx.wait_ms;
+  // A unicast reply comes back on the channel the request went out on: 0 of 300 unicast RX
+  // events (CHALLENGE_REQ + PRIVATE_RESP, 50 cycles each on SX1276/SX1262/LR1121) arrived off
+  // the request channel. Holding the channel needs no dwell and no hop-after-timeout guard —
+  // there is nowhere else a reply could come from.
+  spec.policy = ListenPolicy::HOLD_REQUEST_CHANNEL;
+
+  auto disp = decisions::ExchangeFirstResponseDisposition::IGNORE_UNRELATED;
+  RadioRxPacket packet{};
+  auto outcome = this->listen(spec, packet, ctx.rx, [&](const IoFrame *parsed, const RadioRxPacket &pkt) {
+    if (parsed == nullptr) {
+      this->record_debug("first_parse_fail", ctx.try_index, false);
+      this->counters_.parse_failures++;
+      log_unparsable_frame("Unparsable first response", ctx.try_index, pkt);
+      return ReplyDisposition::IGNORE;
+    }
+    disp = decisions::classify_exchange_first_response(request, *parsed);
+    if (disp == decisions::ExchangeFirstResponseDisposition::IGNORE_UNRELATED) {
+      this->record_debug("first_wrong_exchange", ctx.try_index, false);
+      log_exchange_frame("Ignored first response", ctx.try_index, *parsed, pkt.len);
+      return ReplyDisposition::IGNORE;
+    }
+    ctx.first_response_ms = millis();
+    return ReplyDisposition::ACCEPT;
+  });
+
+  if (outcome == ListenOutcome::ACCEPTED)
+    return disp;
+
+  ctx.state = exchange::OutboundExchangeState::FAILED;
+  this->record_debug("wait_first_timeout", ctx.try_index, false);
+  char age[TRY_AGE_BUFFER_SIZE];
+  format_try_age(ctx, age);
+  ESP_LOGI(TAG, "Try %d ended: no first response for cmd=%s(0x%02X) within %" PRIu32 " ms preamble=%u age_ms=%s",
+           ctx.try_index, command_name(request.cmd), request.cmd, ctx.wait_ms, ctx.request_preamble, age);
+  return decisions::ExchangeFirstResponseDisposition::IGNORE_UNRELATED;
+}
+
+bool ExchangeEngine::handle_authentication_(const IoFrame &request, uint32_t freq,
+                                            exchange::OutboundExchangeContext &ctx) {
+  ctx.saw_challenge = true;
+  ctx.state = exchange::OutboundExchangeState::BUILD_AUTH_RESPONSE;
+  this->record_debug(outbound_stage_name(ctx.state), ctx.try_index, true);
+
+  // No challenge bytes here: the raw 0x3C payload plus the 0x3D response it provokes is a
+  // known-plaintext/known-ciphertext pair under the system key (see redaction.h). The generic
+  // frame-log helpers (log_frame()/log_component_capture()) already mask both commands.
+  char age[TRY_AGE_BUFFER_SIZE];
+  format_try_age(ctx, age);
+  ESP_LOGI(TAG, "Auth challenge try=%d wait_ms=%" PRIu32 " req_cmd=0x%02X req_len=%u preamble=%u age_ms=%s",
+           ctx.try_index, ctx.first_response_ms - ctx.try_start_ms, request.cmd, request.data_len, ctx.request_preamble,
+           age);
+
+  ctx.state = exchange::OutboundExchangeState::TX_AUTH_RESPONSE;
+  this->record_debug(outbound_stage_name(ctx.state), ctx.try_index, true);
+  // answer_challenge() covers both the 0x3D build and its transmit as one step, so a failure here
+  // does not distinguish which of the two failed.
+  if (!this->answer_challenge(request, ctx.rx, freq)) {
+    ctx.state = exchange::OutboundExchangeState::FAILED;
+    this->record_debug("auth_response_failed", ctx.try_index, true);
+    return false;
+  }
+  this->counters_.challenge_round_trips++;
+  return true;
+}
+
+bool ExchangeEngine::answer_challenge(const IoFrame &request, const IoFrame &challenge, uint32_t freq) {
+  IoFrame auth_resp;
+  if (!create_challenge_resp(auth_resp, request.dst, this->node_id_, challenge.data, request, this->system_key_))
+    return false;
+  return this->transmit_frame(auth_resp, freq, (*this->radio_ptr_)->response_preamble());
+}
+
+uint8_t ExchangeEngine::tries_after_unconfirmed_(const IoFrame &request, uint8_t unconfirmed_tries, uint8_t try_index,
+                                                 uint32_t elapsed_ms, uint32_t next_tx_ms) {
+  // Only an EXECUTE's answer depends on the target, so only an EXECUTE pays for the lookup. A
+  // destination the hub has no record of has never confirmed anything.
+  decisions::TargetEvidence evidence{};
+  if (request.cmd == CMD_EXECUTE && this->target_evidence_provider_)
+    this->target_evidence_provider_(request.dst, evidence);
+  if (!decisions::retry_after_unconfirmed_accept_is_safe(request, evidence.confirms_execute, unconfirmed_tries))
+    return 0;
+  if (request.cmd != CMD_EXECUTE)
+    return EXCHANGE_RETRY_COUNT;  // no cap of its own: the exchange's retry count and budget bound it
+  // A re-send whose transmission could not end inside the exchange budget is not worth waiting for.
+  if (!this->try_fits_budget_(elapsed_ms, UNCONFIRMED_EXECUTE_RESEND_DELAY_MS, next_tx_ms))
+    return 0;
+  // The re-send may well succeed, and then no exchange-failure or unconfirmed line is printed at
+  // all, so this is the one record that the first copy's reply went missing.
+  ESP_LOGI(TAG,
+           "Try %u accepted without a closing reply for cmd=%s(0x%02X): re-sending, the device normally "
+           "confirms (final_rx_ignored=%u final_rx_failed=%u)",
+           try_index, command_name(request.cmd), request.cmd, this->debug_.final_rx_ignored,
+           this->debug_.final_rx_failed);
+  // Stretch the ordinary retry gap the loop is about to wait to the longer re-send gap, so a device
+  // still busy acting on the first copy has finished before the re-send reaches it.
+  App.feed_wdt();
+  delay(UNCONFIRMED_EXECUTE_RESEND_DELAY_MS - EXCHANGE_RETRY_DELAY_MS);
+  // The re-send is the only further copy of a CMD_EXECUTE: if it goes unanswered altogether, the
+  // ordinary failure retry must not add a third one to a device that already has the command.
+  return UNCONFIRMED_EXECUTE_MAX_RESENDS;
+}
+
+decisions::ExchangeFinalResponseDisposition ExchangeEngine::wait_for_final_response_(
+    const IoFrame &request, exchange::OutboundExchangeContext &ctx) {
+  // Same budget as any other continuation frame — RESPONSE_AUTH_WAIT_MS was always an alias for
+  // RESPONSE_WAIT_MS, so the two share one knob rather than inventing a third.
+  const uint32_t auth_wait_ms = this->tuning_->exchange_response_wait_ms;
+
+  ListenSpec spec;
+  spec.window_ms = auth_wait_ms;
+  // Same reasoning as wait_for_first_response_(): a unicast reply comes back on the request
+  // channel (0 of 300 unicast RX events measured off-channel across all three chips), so holding
+  // the channel for the whole wait is strictly correct and needs no dwell.
+  spec.policy = ListenPolicy::HOLD_REQUEST_CHANNEL;
+
+  ListenStats stats;
+  spec.stats = &stats;
+
+  RadioRxPacket packet{};
+  auto outcome = this->listen(spec, packet, ctx.rx, [&](const IoFrame *parsed, const RadioRxPacket &pkt) {
+    if (parsed == nullptr) {
+      this->record_debug("final_parse_fail", ctx.try_index, true);
+      this->counters_.parse_failures++;
+      log_unparsable_frame("Unparsable final response", ctx.try_index, pkt);
+      return ReplyDisposition::IGNORE;
+    }
+    if (is_valid_final_response(*parsed, request))
+      return ReplyDisposition::ACCEPT;
+    this->record_debug("final_wrong_exchange", ctx.try_index, true);
+    log_exchange_frame("Ignored final response", ctx.try_index, *parsed, pkt.len);
+    return ReplyDisposition::IGNORE;
+  });
+
+  this->note_final_wait_(stats);
+  if (outcome == ListenOutcome::ACCEPTED)
+    return decisions::ExchangeFinalResponseDisposition::ACCEPT;
+
+  ctx.state = exchange::OutboundExchangeState::FAILED;
+  this->record_debug("wait_final_timeout", ctx.try_index, true);
+  ESP_LOGI(TAG, "Try %d ended: no matching final response for cmd=%s(0x%02X) within %" PRIu32 " ms", ctx.try_index,
+           command_name(request.cmd), request.cmd, auth_wait_ms);
+  return decisions::ExchangeFinalResponseDisposition::IGNORE_UNRELATED;
+}
+
+// ============================================================================
+// Broadcast roll-call
+// ============================================================================
+
+uint8_t ExchangeEngine::collect_broadcast_responses(const IoFrame &request, uint32_t freq, uint8_t expected_cmd,
+                                                    uint32_t window_ms, const BroadcastReplyHandler &on_reply,
+                                                    ListenPolicy policy) {
+  this->reset_debug(request.cmd);
+
+  if (!this->transmit_frame(request, freq, this->request_preamble_for(request))) {
+    this->record_debug("broadcast_tx_failed", 1, false);
+    return 0;
+  }
+  const uint32_t tx_done_ms = millis();
+
+  RadioDriver *radio = *this->radio_ptr_;
+  uint8_t count = 0;
+
+  ListenSpec spec;
+  spec.window_ms = window_ms;
+  // policy is the caller's choice: ROTATE_SKIPPING_REQUEST (the default) leaves the request
+  // channel unattended because so few replies land there for that caller's population; a caller
+  // whose replies do land there passes ROTATE_ALL_CHANNELS instead. request_freq is set
+  // unconditionally — harmless for ROTATE_ALL_CHANNELS, which never reads it.
+  spec.policy = policy;
+  spec.request_freq = freq;
+  // dwell_ms is left at 0: no measured reason to dwell differently from discovery, so listen()
+  // asks the driver via hop_dwell_ms() instead of hardcoding a value here.
+  // A reception proves this channel carries responders and replies arrive spread across the whole
+  // window, so staying on it costs nothing; hopping away would only shrink the time spent where
+  // responders already are.
+  spec.hop_after_ignored_frame = false;
+  spec.linger_on_preamble = true;
+  spec.linger_dwell_ms = PREAMBLE_LINGER_DWELL_MS;
+
+  RadioRxPacket packet{};
+  IoFrame frame{};
+  this->listen(spec, packet, frame, [&](const IoFrame *parsed, const RadioRxPacket &pkt) {
+    if (parsed == nullptr || parsed->cmd != expected_cmd || memcmp(parsed->dst, this->node_id_, NODE_ID_SIZE) != 0)
+      return ReplyDisposition::IGNORE;
+
+    BroadcastReplyInfo info{};
+    info.rssi_dbm = radio->get_last_capture().rssi_dbm;
+    info.rx_freq_hz = pkt.freq_hz;
+    info.after_tx_ms = millis() - tx_done_ms;
+    on_reply(*parsed, info);
+    if (count < UINT8_MAX)
+      ++count;
+    // Collection always runs to the deadline: a roll-call has no single "the" reply, so nothing
+    // this loop can see is ever a reason to stop early.
+    return ReplyDisposition::IGNORE;
+  });
+
+  this->record_debug("broadcast_collect_done", 1, false);
+  return count;
+}
+
+// ============================================================================
+// Shared listen primitive
+//
+// The one listen loop every radio wait in this project runs through: send_and_receive()'s
+// first/final-response waits, collect_broadcast_responses(), and PairingEngine's discovery/
+// key-transfer/key-confirm waits all call listen() below with a ListenSpec that picks one of
+// the three ListenPolicy values (hold the request channel, rotate all three, or rotate skipping
+// the request channel). Per-loop behavior — what counts as a match, what aborts, what gets
+// logged — lives entirely in the caller's ReplyHandler; this function owns only the
+// slice/hop/deadline mechanics common to all of them.
+// ============================================================================
+
+namespace {
+
+/// Count one event in a ListenStats field without wrapping past 255.
+void count_saturating(uint8_t &counter) {
+  if (counter < UINT8_MAX)
+    counter++;
+}
+
+/// Parse one received packet, hand it to `on_frame`, and translate an ACCEPT/ABORT disposition
+/// into `outcome`; a frame the handler ignores is counted in `stats` when the caller asked for
+/// counts. Factored out of listen()'s two reception sites to keep that function's cognitive
+/// complexity under the clang-tidy threshold.
+/// @return true if the listen should stop (ACCEPT or ABORT was returned); false to keep waiting.
+bool dispatch_received_packet(const ReplyHandler &on_frame, const RadioRxPacket &packet, IoFrame &frame,
+                              ListenOutcome &outcome, ListenStats *stats) {
+  const bool parsed = parse(packet.data, packet.len, frame);
+  switch (on_frame(parsed ? &frame : nullptr, packet)) {
+    case ReplyDisposition::ACCEPT:
+      outcome = ListenOutcome::ACCEPTED;
+      return true;
+    case ReplyDisposition::ABORT:
+      outcome = ListenOutcome::ABORTED;
+      return true;
+    case ReplyDisposition::IGNORE:
+      break;
+  }
+  if (stats != nullptr)
+    count_saturating(stats->frames_ignored);
+  return false;
+}
+
+/// Record a holding listen's failed reception. Called at the moment it happens, because the re-arm
+/// that follows clears the radio capture that describes it.
+void count_failed_reception(ListenStats *stats, const RadioDriver *radio) {
+  if (stats == nullptr)
+    return;
+  count_saturating(stats->failed_receptions);
+  stats->last_failed_irq = radio->get_last_capture().irq_status;
+}
+
+/// A frame is arriving: hopping now would cut it off mid-reception. Both halves are live on every
+/// current chip.
+bool preamble_or_sync_incoming(RadioDriver *radio, const ListenSpec &spec) {
+  return spec.linger_on_preamble && (radio->is_preamble_detected() || radio->is_sync_detected());
+}
+
+/// Per-channel dwell for a rotating listen: `spec.dwell_ms` if the caller set one, otherwise the
+/// driver's own answer to "how long must this radio sit on a channel after retuning before it can
+/// hear anything at all" (see RadioDriver::hop_dwell_ms()). Unused (returns 0) for a holding
+/// listen — HOLD never slices, so it never asks. Factored out of listen() purely to avoid a
+/// nested conditional operator and keep that function's cognitive complexity under the clang-tidy
+/// threshold — no behavior beyond the two-way fallback.
+uint32_t resolve_dwell_ms(const ListenSpec &spec, bool rotating, RadioDriver *radio, const TuningConfig &tuning) {
+  if (!rotating)
+    return 0;
+  if (spec.dwell_ms != 0)
+    return spec.dwell_ms;
+  return radio->hop_dwell_ms(tuning);
+}
+
+}  // namespace
+
+void ExchangeEngine::listen_hop_(uint32_t skip, const ListenSpec &spec) {
+  this->hop_frequency(skip);
+  if (spec.on_hop)
+    spec.on_hop();
+}
+
+ListenOutcome ExchangeEngine::listen(const ListenSpec &spec, RadioRxPacket &packet, IoFrame &frame,
+                                     const ReplyHandler &on_frame) {
+  RadioDriver *radio = *this->radio_ptr_;
+  const uint32_t deadline = millis() + spec.window_ms;
+  const bool rotating = spec.policy != ListenPolicy::HOLD_REQUEST_CHANNEL;
+  const uint32_t skip = spec.policy == ListenPolicy::ROTATE_SKIPPING_REQUEST ? spec.request_freq : 0;
+  // 0 means "ask the driver": no rotating call site in this project has a measured reason to
+  // dwell differently from the chip's own retune-cost answer (RadioDriver::hop_dwell_ms()), so
+  // all of them leave spec.dwell_ms at 0 and share one chip-specific knob instead of inventing a
+  // second.
+  const uint32_t dwell = resolve_dwell_ms(spec, rotating, radio, *this->tuning_);
+
+  // A skipping listen's replies almost never return on the requesting channel (see ListenPolicy's
+  // own doc comment for why), so it leaves that channel before its first dwell rather than
+  // spending one there.
+  if (spec.policy == ListenPolicy::ROTATE_SKIPPING_REQUEST)
+    this->listen_hop_(skip, spec);
+
+  while ((int32_t) (deadline - millis()) > 0) {
+    const uint32_t remaining = deadline - millis();
+    // A holding listen waits the whole remaining window in one call: it has nothing to do between
+    // slices, wait_for_packet() feeds the watchdog while it blocks, and every expired slice costs
+    // an RX re-arm. Only a rotating listen needs a per-channel dwell.
+    const uint32_t slice = rotating ? std::min(remaining, dwell) : remaining;
+
+    if (radio->wait_for_packet(packet, slice)) {
+      ListenOutcome outcome = ListenOutcome::TIMED_OUT;
+      if (dispatch_received_packet(on_frame, packet, frame, outcome, spec.stats))
+        return outcome;
+      // The roll-call leaves this false because a reception proves responders are on this
+      // channel (see the field doc in hub_exchange.h); discovery is the only listen that hops
+      // after an ignored frame.
+      if (rotating && spec.hop_after_ignored_frame && (int32_t) (deadline - millis()) > 0 &&
+          !preamble_or_sync_incoming(radio, spec))
+        this->listen_hop_(skip, spec);
+      continue;
+    }
+
+    if ((int32_t) (deadline - millis()) <= 0)
+      break;
+    if (!rotating) {
+      count_failed_reception(spec.stats, radio);  // HOLD: an early false is a failed reception, not a timeout.
+      continue;
+    }
+    if (!preamble_or_sync_incoming(radio, spec)) {
+      this->listen_hop_(skip, spec);
+      continue;
+    }
+    // Preamble/sync seen at the dwell boundary: extend by linger_dwell_ms and give the frame its
+    // air time instead of hopping — a short extension wait, not another full per-channel dwell.
+    const uint32_t ext = std::min((uint32_t) (deadline - millis()), spec.linger_dwell_ms);
+    ListenOutcome outcome = ListenOutcome::TIMED_OUT;
+    if (radio->wait_for_packet(packet, ext) && dispatch_received_packet(on_frame, packet, frame, outcome, spec.stats))
+      return outcome;
+  }
+  return ListenOutcome::TIMED_OUT;
+}
+
+// ============================================================================
+// Inbound authentication
+// ============================================================================
+
+bool ExchangeEngine::authenticate_request(const IoFrame &request, uint32_t freq) {
+  RadioDriver *radio = *this->radio_ptr_;
+  exchange::InboundAuthContext context;
+  context.state = exchange::InboundAuthState::TX_CHALLENGE;
+  this->record_debug(inbound_stage_name(context.state), 1, true);
+
+  if (!create_challenge_req(context.challenge, request.src, this->node_id_)) {
+    context.state = exchange::InboundAuthState::FAILED;
+    this->record_debug(inbound_stage_name(context.state), 1, true);
+    return false;
+  }
+  if (!this->transmit_frame(context.challenge, freq, radio->response_preamble())) {
+    context.state = exchange::InboundAuthState::FAILED;
+    this->record_debug(inbound_stage_name(context.state), 1, true);
+    return false;
+  }
+
+  context.state = exchange::InboundAuthState::WAIT_CHALLENGE_RESPONSE;
+  this->record_debug(inbound_stage_name(context.state), 1, true);
+
+  RadioRxPacket packet{};
+  if (!radio->wait_for_packet(packet, this->tuning_->exchange_response_wait_ms)) {
+    context.state = exchange::InboundAuthState::FAILED;
+    this->record_debug(inbound_stage_name(context.state), 1, true);
+    return false;
+  }
+
+  IoFrame rx;
+  if (!parse(packet.data, packet.len, rx) || !frame_is_challenge_response(rx)) {
+    context.state = exchange::InboundAuthState::FAILED;
+    this->record_debug(inbound_stage_name(context.state), 1, true);
+    return false;
+  }
+
+  // Transcript is the *device's* own frame (cmd + data), not our challenge — the challenged
+  // party authenticates what it said. Long assumed by symmetry with our outbound direction;
+  // confirmed against real hardware bytes by the device-side 0x3D in
+  // tests/corpus/captures/pairing/velux_kux100_pairing_full.yaml.
+  uint8_t frame_data[FRAME_MAX_SIZE];
+  frame_data[0] = request.cmd;
+  memcpy(frame_data + 1, request.data, request.data_len);
+  if (!crypto::verify_hmac(frame_data, request.data_len + 1, rx.data, context.challenge.data, this->system_key_)) {
+    context.state = exchange::InboundAuthState::FAILED;
+    this->record_debug(inbound_stage_name(context.state), 1, true);
+    return false;
+  }
+
+  context.state = exchange::InboundAuthState::VERIFIED;
+  this->record_debug(inbound_stage_name(context.state), 1, true);
+  this->counters_.challenge_round_trips++;
+  return true;
+}
+
+}  // namespace home_io_control
+}  // namespace esphome

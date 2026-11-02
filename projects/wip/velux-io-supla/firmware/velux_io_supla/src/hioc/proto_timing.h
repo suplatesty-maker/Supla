@@ -1,0 +1,297 @@
+#pragma once
+
+/// @file proto_timing.h
+/// @brief Physical-layer radio and timing parameters for the IO-Homecontrol protocol.
+/// @ingroup hioc_protocol
+
+#include <cstdint>
+
+namespace esphome {
+namespace home_io_control {
+
+// ============================================================================
+// Physical Layer — Radio Parameters
+// ============================================================================
+
+/// The protocol uses 3 frequency channels in the 868 MHz ISM band.
+/// IO-Homecontrol uses 3 channels in the 868 MHz SRD band. In 1W (one-way) mode,
+/// only CH2 is used. In 2W (two-way) mode, the controller hops across all three
+/// channels every ~2.7ms when idle. Commands are sent on CH2; responses may arrive
+/// on any channel within the exchange wait window.
+static constexpr uint32_t FREQ_CH1 = 868250000;  ///< Channel 1: 868.25 MHz (2W only)
+static constexpr uint32_t FREQ_CH2 = 868950000;  ///< Channel 2: 868.95 MHz (1W and 2W, TX channel)
+static constexpr uint32_t FREQ_CH3 = 869850000;  ///< Channel 3: 869.85 MHz (2W only)
+
+/// Preamble is a sequence of 0xAA bytes that precedes every frame.
+/// Any start frame carrying `CTRL1_LOW_POWER` — a directed frame to a low-power target, or the
+/// SPE roll-call's low-power frame shape — uses the long preamble (1024 bytes = 8192 bits) as a
+/// wake-up burst for a duty-cycled receiver; every other start frame uses the runtime-tunable
+/// `normal_start_preamble`, which an always-listening receiver detects fine. Every continuation
+/// frame (a reply, our challenge or challenge answer, a status-update ACK) uses the radio driver's
+/// `response_preamble()`, since both sides are already on the same channel; SHORT_PREAMBLE is that
+/// value's protocol default and the tuning floor. The exchange engine derives all of this from the
+/// frame (exchange_engine.cpp).
+static constexpr uint16_t LONG_PREAMBLE = 1024;  ///< 1024 bytes: wake-up burst for a low-power start frame
+static constexpr uint16_t SHORT_PREAMBLE = 8;    ///< Protocol default and floor for continuation frames
+
+/// Default for `TuningConfig::cold_broadcast_reply_preamble` — preamble for a *broadcast* reply to
+/// a frame the peer caught via a rotating/hopping listen (currently: only the key-extraction
+/// responder's 0x29, the sole `start=true` frame any device-role builder in this codebase
+/// produces) — long enough to be reliably caught by a hopping receiver, short enough that
+/// broadcasting it across all 3 channels doesn't block the loop the way LONG_PREAMBLE does.
+///
+/// Sized above the ~13.9 ms real-device discovery-reply preamble this project's own SX1262/LR1121
+/// discovery hop-slice tuning was measured against (issue #65 SDR analysis) — that measurement is
+/// what "reliably caught by a hopping receiver" is calibrated to here. 80 bytes ≈ 16.7 ms at the
+/// protocol's 38400 bps line rate (soft_phy_air_time_us()),
+/// budgeted as a starting point, not yet hardware-validated for this exact chip/scenario
+/// combination. Runtime-tunable via `cold_broadcast_reply_preamble` for exactly that reason.
+static constexpr uint16_t COLD_BROADCAST_REPLY_PREAMBLE = 80;
+
+/// Default for `TuningConfig::normal_start_preamble` — the preamble in front of a directed *start*
+/// frame whose target is **not** a low-power / duty-cycled device (`CTRL1_LOW_POWER` clear). An
+/// always-listening receiver does not need the ~213 ms `LONG_PREAMBLE` wake-up burst, and some
+/// receivers never lock onto one that long; a normal start frame gets this shorter preamble
+/// instead, matching what a reference hub sends to an always-alive device.
+///
+/// 32 bytes = 256 bits sits inside the preamble band the iown-homecontrol documentation describes
+/// (256 bits in its radio notes; 128 bits is the "Long PPDU" preamble in its link-layer notes),
+/// well above the ~12-byte response preamble a
+/// short-turnaround chip uses, ~6.7 ms of air time, and two orders of magnitude below the 1024-byte
+/// burst. 8 bytes is a proven lower bound against paired always-alive devices but nothing bounds
+/// where a start frame stops being heard, so 32 is the defensible middle — and `normal_start_preamble`
+/// is a live tuning knob so a wrong guess costs a number change, not a rebuild.
+static constexpr uint16_t NORMAL_START_PREAMBLE = 32;
+
+/// Default for `TuningConfig::pairing_discovery_preamble` — the preamble on the pairing discovery
+/// broadcast (`CMD_DISCOVER_REQ`/`CMD_DISCOVER_ALT_REQ`, 0x28/0x2E). `LONG_PREAMBLE`, because a
+/// device in learning mode may be a duty-cycled receiver that needs the wake-up burst. Unlike a
+/// directed start frame (see `NORMAL_START_PREAMBLE`), the discovery broadcast can't follow the
+/// target's power class: discovery runs before anything is known about the device. Some awake
+/// receivers never lock onto a preamble this long — a VELUX SSL solar roller shutter answers
+/// discovery only at a short preamble — so the value is runtime-tunable via
+/// `pairing_discovery_preamble`, and pairing reuses the tuned value for the frames it then sends
+/// to the discovered device (`PairingEngine::pairing_start_preamble_()`).
+static constexpr uint16_t PAIRING_DISCOVERY_PREAMBLE = LONG_PREAMBLE;
+
+/// How hard a transmission has to work to be heard: the wake-up level the receiver needs. A radio
+/// that wakes receivers by preamble length gets the same information from
+/// `RadioTxConfig::preamble_len` and may ignore this; a radio that wakes them some other way (a
+/// train of frames, for example) reads it instead of guessing from a preamble length.
+enum class TxWake : uint8_t {
+  NONE,   ///< The receiver is already listening on this channel: the frame continues an exchange.
+  SHORT,  ///< The receiver is awake, but may be scanning channels.
+  LONG,   ///< The receiver may be duty-cycling.
+};
+
+/// True when a preamble this long is the wake-up burst for a duty-cycled receiver. Every preamble
+/// tunable except `pairing_discovery_preamble` is capped well below `LONG_PREAMBLE`, and that one
+/// is capped at it, so only a real wake-up burst reaches the threshold.
+constexpr bool is_wake_preamble(uint16_t len) { return len >= LONG_PREAMBLE; }
+
+/// The wake-up level of a frame, from the two facts that decide it: whether it starts an exchange
+/// (a continuation reaches a receiver that is already listening) and whether its preamble is the
+/// wake-up burst.
+constexpr TxWake tx_wake_for(bool start, uint16_t preamble) {
+  if (!start)
+    return TxWake::NONE;
+  return is_wake_preamble(preamble) ? TxWake::LONG : TxWake::SHORT;
+}
+
+/// Preamble/sync linger extension for a rotating listen (`ListenSpec::linger_dwell_ms`): how much
+/// longer to stay on a channel once a frame is visibly incoming, so a hop doesn't cut it off
+/// mid-reception. Sized to a frame's air time, not to a hop slice, so it does not need to change
+/// when a chip's hop slice does. Shared by every rotating listen (pairing discovery, broadcast
+/// roll-call): both wait for the same class of short protocol frame, so there is no measured
+/// reason for them to differ.
+static constexpr uint32_t PREAMBLE_LINGER_DWELL_MS = 15;
+// Chip-specific defaults (response preamble, post-TX settle, per-chip discovery hop slices
+// for SX1262 and LR1121) live beside their TuningConfig fields in tuning_config.h; the
+// SX1262/LR1121 exchange dwell constants live in radio_sx1262.h / radio_lr1121.h respectively.
+// Kept out of the generic protocol layer per the radio-timing layering cleanup — this header
+// holds only chip-neutral protocol values.
+
+/// Timing constants for frequency hopping and response waiting.
+static constexpr int32_t HOP_TIME_US = 2700;      ///< Time per channel when hopping (2.7ms)
+static constexpr int32_t RESPONSE_WAIT_MS = 500;  ///< Wait for response to non-start frame
+
+/// Wait for a response to a start frame — the first frame of an exchange, and the one a sleeping
+/// device has just been woken by.
+///
+/// This device class replies within a few milliseconds of the carrier dropping, or not at all —
+/// it is fast-or-never, not slow. A failure therefore shows up as `saw_challenge=0` with no frame
+/// received at all, rather than as a late arrival, so a longer window cannot fix a device that
+/// genuinely fails to answer.
+///
+/// 400 ms sits comfortably above every directly measured reply while keeping a failed exchange
+/// inside EXCHANGE_TOTAL_BUDGET_MS, so a dead device does not block the ESPHome loop past its own
+/// warning threshold (ADR 0013). Raise `exchange_start_response_wait_ms` from YAML if a device ever
+/// genuinely answers late — but check `wait_ms` in the logs first, since a fast-or-never device is a
+/// turnaround problem that a longer window cannot fix.
+static constexpr int32_t RESPONSE_START_WAIT_MS = 400;
+
+static constexpr int32_t RESPONSE_AUTH_WAIT_MS =
+    RESPONSE_WAIT_MS;                                    ///< Wait for final response after challenge response
+static constexpr int32_t EXCHANGE_RETRY_DELAY_MS = 250;  ///< Gap between retries within one HA command
+static constexpr uint8_t EXCHANGE_RETRY_COUNT = 3;       ///< Attempts per command before reporting failure
+/// Re-sends allowed for a CMD_EXECUTE the target accepted without a closing reply, within the same
+/// exchange and its retry budget. One: a second silent try says the loss is not a one-off, and a
+/// third copy of a movement command would only lengthen the blocked loop. See
+/// decisions::retry_after_unconfirmed_accept_is_safe().
+static constexpr uint8_t UNCONFIRMED_EXECUTE_MAX_RESENDS = 1;
+/// Gap before that re-send, in place of EXCHANGE_RETRY_DELAY_MS. A device that did act on the first
+/// copy is often deaf for about a second while its motor or load switches: on a Somfy awning, a
+/// re-send 0.77 s after the first copy drew no challenge at all in 3 of 14 cases. With this gap the
+/// re-send goes out about 1.3 s after the first copy, and the whole exchange still fits
+/// EXCHANGE_TOTAL_BUDGET_MS.
+static constexpr uint32_t UNCONFIRMED_EXECUTE_RESEND_DELAY_MS = 750;
+static_assert(UNCONFIRMED_EXECUTE_RESEND_DELAY_MS >= EXCHANGE_RETRY_DELAY_MS,
+              "the re-send gap extends the ordinary retry gap, it never shortens it");
+
+/// How long evidence that a low-power receiver is moving keeps it believed awake enough to hear the
+/// short start preamble first. A moving VELUX solar receiver ignores the 1024-byte wake-up
+/// preamble but answers the short one, so a command, STOP or poll sent mid-travel must lead with
+/// the short one. Sized above the longest cover travel this project has measured; a first estimate
+/// that field logs will correct. Past it the receiver is presumed to have finished and fallen back
+/// asleep.
+static constexpr uint32_t LOW_POWER_MAX_TRAVEL_MS = 120000;
+
+/// Tries for pairing's phase-3 SetConfig1 (0x6F). One: no device on record accepts it (a Somfy
+/// Izymo answers `FE 28`, a VELUX SSL solar roller shutter stays silent) and no real controller
+/// sends it, so a retry only adds 0.7–0.9 s of blocking and a frame of airtime to every pairing
+/// with a silent device. A challenged try still completes its 0x3C/0x3D round within the one try.
+static constexpr uint8_t PAIRING_SET_CONFIG1_MAX_TRIES = 1;
+
+/// Exchange tries for a status poll the scheduler owns — every status poll issued while
+/// StatusPollPolicy is tracking the device, which today is every status poll this component can
+/// produce (there is no user-facing "refresh status" button or action; if one is ever added, it
+/// must not take this branch).
+///
+/// Such a poll's failure is re-armed by the backoff ladder (STATUS_RETRY_AFTER_FAIL_MS and its
+/// successors), so the ladder *is* its retry mechanism; stacking EXCHANGE_RETRY_COUNT blocking
+/// in-exchange tries on top of it buys no freshness and costs ~1.6 s of blocked loop() while a
+/// device is unresponsive (e.g. an actuator mid-manoeuvre) — the settle poll fires seconds after a
+/// command, squarely inside the manoeuvre, so keeping it a single try is what lets a STOP a user
+/// presses mid-move dispatch promptly. A poll with no ladder behind it keeps the full
+/// EXCHANGE_RETRY_COUNT. SCHEDULED_POLL_RETRY_GRACE_FIRST_FAILURE and STOP_SETTLE_POLL_TRIES below
+/// are the two places this trade-off is deliberately bought back.
+static constexpr uint8_t SCHEDULED_POLL_MAX_TRIES = 1;
+
+/// Ladder positions at which a scheduler-owned status poll gets the full EXCHANGE_RETRY_COUNT back.
+///
+/// The single try above is right at both ends of the backoff ladder and wrong in the middle. At the
+/// first slot after a command the device is still executing the manoeuvre: its silence is expected,
+/// retries cannot change that, and blocking loop() for the full retry product would delay a STOP
+/// the user presses mid-move. Once a device has missed several slots in a row it is unreachable
+/// rather than merely asleep, and retries are just as pointless. In between sits the slot where the
+/// manoeuvre has just ended and the device is awake again but duty-cycled — one 400 ms listen
+/// samples its receive window once; EXCHANGE_RETRY_COUNT tries sample it three times, ~870 ms apart,
+/// and a success there also clears the failure streak and ends the backoff.
+///
+/// Counted in consecutive silent failures already recorded when the poll is dispatched, so 0 is the
+/// post-command settle poll and 1..3 are the ~5 s / ~15 s / ~30 s ladder slots after it — roughly
+/// t+8 s to t+53 s, spanning every cover travel time this project has measured. An auth-shaped
+/// streak is excluded entirely: a device that answers with a 0x3C challenge is awake, so extra
+/// tries buy no wake-up, and an auth try is the most expensive shape the engine runs.
+static constexpr uint8_t SCHEDULED_POLL_RETRY_GRACE_FIRST_FAILURE = 1;
+static constexpr uint8_t SCHEDULED_POLL_RETRY_GRACE_LAST_FAILURE = 3;
+
+/// Exchange tries for the settle poll after an accepted STOP.
+///
+/// The single-try rule above protects a STOP pressed during a manoeuvre from a blocking poll. After
+/// an accepted STOP nothing is moving, and the user's next action — reversing the cover — waits on
+/// exactly this poll, because until it answers the entity still shows the last reported position.
+/// A single try bets that on one sample of a receiver whose state right after a STOP is uncertain
+/// (still running down, awake, or already back on its duty cycle); a miss costs the full
+/// STATUS_RETRY_AFTER_FAIL_MS backoff before the next look. The full budget samples it up to three
+/// times within one exchange (under EXCHANGE_TOTAL_BUDGET_MS), and blocks only when all of them miss.
+static constexpr uint8_t STOP_SETTLE_POLL_TRIES = EXCHANGE_RETRY_COUNT;
+
+/// Wall-clock ceiling on one whole exchange, retries included.
+///
+/// EXCHANGE_RETRY_COUNT tries x (long preamble + response window + retry gap) is what actually
+/// determines how long a failing command blocks the ESPHome loop, and that blocking also starves
+/// the receive path the rest of the exchange depends on. ESPHome itself warns when one operation
+/// takes longer than 2550 ms (ADR 0013); this budget must stay under that threshold.
+///
+/// So the retry count is a maximum, not a promise: a try only starts if its transmission ends inside
+/// the budget — elapsed time, plus the gap before the try, plus the radio's estimate of the try's
+/// transmit time (`RadioDriver::tx_air_time_us()`), must stay below it. Counting the transmission
+/// keeps a radio with a long wake-up from starting a try it cannot finish in time. At the current
+/// 400 ms response window all three tries still fit (~2.3 s); raising the window well past the
+/// default is what starts trimming retries, since three full tries stop being affordable at that
+/// point — one long listen is the better trade there anyway.
+static constexpr uint16_t EXCHANGE_TOTAL_BUDGET_MS = 2500;
+
+/// One-way (1W) transmit cadence.
+///
+/// A 1W command is fire-and-forget: nothing replies, so there is no acknowledgement to retry on
+/// and no way to learn a frame was missed. Repetition *is* the reliability mechanism — real
+/// remotes send the same frame four times, and a receiving device treats the set as one command
+/// because all four carry the same sequence. These are protocol values shared by every 1W
+/// transmitter, not radio tuning: they do not vary by chip and must not be moved into a driver or
+/// a TuningConfig field.
+///
+/// Both values come from the reference implementation, which sets them on adjacent lines when it
+/// forges a 1W packet: `packet->repeat = 4` and `packet->repeatTime = 40` in its 1W remote. The
+/// capture logs embedded in that same source show
+/// consecutive copies of one burst arriving roughly 25 ms apart, which is not a contradiction:
+/// those are receive-side timestamps of a burst whose configured gap is 40 ms, so they measure
+/// something else. Do not "correct" 40 down to 25 on the strength of them.
+///
+/// Erring long would in any case be the safe direction — a device needs only one of the four
+/// copies to land, so a wider spacing costs nothing and leaves more room on a shared band.
+///
+/// The resulting burst duration — see ONEWAY_BURST_INTERVAL_MS's own comment and send_burst()'s
+/// doxygen (oneway_transmitter.h) for what it decomposes into per power class — is what
+/// ONEWAY_QUIET_PERIOD_MS (status_poll_policy.h) is sized against when it holds background polls
+/// back during 1W activity.
+static constexpr uint8_t ONEWAY_BURST_REPEATS = 4;  ///< Copies of each 1W command sent per press.
+/// Gap between those copies. Three gaps between four copies is 3 * 40 = 120 ms of pure *delay*,
+/// fixed regardless of the identity's power class. What that adds up to on the wire depends on
+/// each copy's own airtime, which is a per-identity, per-copy choice (`OneWayPowerClass`,
+/// oneway_controller.h; ADR 0038): a burst with the long preamble on every copy runs well over a
+/// second, one with the short preamble on every copy a few hundred ms. send_burst()'s doxygen
+/// (oneway_transmitter.h) has both real shapes.
+static constexpr uint32_t ONEWAY_BURST_INTERVAL_MS = 40;
+
+/// How long a status reply that named the rain sensor as the last commander stays usable as
+/// evidence that rain protection is active (see decisions::is_rain_limited(), rule b). It is the
+/// memory for recognising a *clamped* position command: while it is fresh, a stopped device that
+/// ended up somewhere other than the commanded target is labelled as limited by rain. Too short,
+/// and a long shower is no longer recognised for the second and later `open` attempts; too long,
+/// and an unrelated clamp (end stop, obstacle, another protection) after the rain has stopped is
+/// mislabelled. A first estimate: the window's own rain-limitation timer is not known, so this
+/// is 2 hours.
+static constexpr uint32_t RAIN_EVIDENCE_HOLD_MS = 2UL * 60UL * 60UL * 1000UL;
+
+/// Listen-before-talk (LBT) parameters for ETSI EN 300 220 compliance.
+/// Before transmitting, the radio checks that the channel RSSI is below the
+/// threshold. If the channel is busy, TX is deferred by LBT_RETRY_DELAY_MS
+/// up to LBT_MAX_RETRIES times.
+static constexpr int16_t LBT_RSSI_THRESHOLD_DBM = -90;  ///< Channel-free threshold (ETSI: ≤ -90 dBm)
+static constexpr uint8_t LBT_MAX_RETRIES = 5;           ///< Max carrier-sense attempts before TX anyway
+static constexpr uint8_t LBT_RETRY_DELAY_MS = 5;        ///< Backoff between LBT checks (≥ 5ms per ETSI)
+
+/// Canonical defaults for the chip-neutral runtime-tunable pairing/discovery parameters.
+///
+/// These are the single source of truth for the diagnostics tuning layer: `TuningConfig`
+/// initializes its fields from them, and the ESPHome YAML schema falls back to them when a
+/// key is omitted. Adjust a value here and both the compiled default and the documented
+/// YAML default follow. Chip-specific tuning defaults live in tuning_config.h instead.
+/// See @ref hioc_tuning.
+static constexpr uint16_t PAIRING_DISCOVERY_WAIT_MS = 2000;  ///< Wait window after sending each discovery command.
+static constexpr uint16_t PAIRING_DISCOVERY_INITIAL_DWELL_MS = 300;  ///< Dwell on CH2 before discovery hopping begins.
+static constexpr uint8_t PAIRING_KEY_EXCHANGE_RETRIES = 3;  ///< Retries for the authenticated key-exchange phase.
+
+/// Default for `TuningConfig::pairing_key_init_delay_ms` — pause after the discover-confirm step
+/// (whether it was ACKed, refused, or silent) and before CMD_KEY_INIT (0x31). No capture
+/// precedent for 300 ms specifically: real hubs take several seconds longer here, and appear to
+/// spend that time re-broadcasting 0x28 to look for more devices, which this project's
+/// single-device discovery phase has no equivalent of. 300 ms is the short end: a Somfy Izymo
+/// dimmer pairs with both 300 ms and 5000 ms here, so the default keeps pairing fast, and
+/// `pairing_key_init_delay_ms` can lengthen it for a device that needs a later 0x31.
+static constexpr uint16_t PAIRING_KEY_INIT_DELAY_MS = 300;
+
+}  // namespace home_io_control
+}  // namespace esphome

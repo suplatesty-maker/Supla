@@ -1,0 +1,9 @@
+# Artefakty kompilacji (elf/map/merged bin - odtwarzalne po kompilacji)
+firmware/build/
+
+# Prywatne pełne kopie urządzenia (Wi-Fi, GUID/AuthKey, ustawienia)
+backups/
+
+# Kopie flasha Shelly (dane kalibracyjne/MAC konkretnego egzemplarza)
+shelly-2pmg3-backup-*.bin
+*.ino.merged.bin

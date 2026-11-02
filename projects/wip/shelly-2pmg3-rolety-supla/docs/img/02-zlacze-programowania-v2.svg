@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 710" font-family="Helvetica, Arial, sans-serif">
+  <title>Shelly 2PM Gen3: połączenia UART 3,3 V, wersja 2</title>
+  <desc>Schemat logiczny, nie widok PCB. TX do RX, RX do TX, wspólna masa. Styk 6 BOOTSEL łączy się z GND przy resecie. Programowanie tylko bez 230 V.</desc>
+  <rect width="1140" height="710" fill="#fff"/>
+  <text x="30" y="35" font-size="22" font-weight="bold" fill="#17202a">Shelly 2PM Gen3: UART 3,3 V (v2)</text>
+  <text x="30" y="63" font-size="14" fill="#444">Schemat logiczny połączeń. Orientację styków sprawdź na rysunku producenta i swoim egzemplarzu.</text>
+
+  <rect x="30" y="95" width="380" height="370" rx="12" fill="#eaf3ea" stroke="#4a7d4a" stroke-width="2"/>
+  <text x="50" y="122" font-size="17" font-weight="bold" fill="#1b5e20">Złącze Shelly: 7 styków, 1,27 mm</text>
+  <g fill="#fff" stroke="#4a7d4a" stroke-width="2">
+    <rect x="380" y="140" width="20" height="20"/>
+    <rect x="380" y="185" width="20" height="20"/>
+    <rect x="380" y="230" width="20" height="20"/>
+    <rect x="380" y="275" width="20" height="20"/>
+    <rect x="380" y="320" width="20" height="20"/>
+    <rect x="380" y="365" width="20" height="20"/>
+    <rect x="380" y="410" width="20" height="20"/>
+  </g>
+  <g font-size="15" fill="#222">
+    <text x="50" y="155">1: ESP_DBG_UART (nie podłączaj)</text>
+    <text x="50" y="200">2: U0TXD (TX urządzenia)</text>
+    <text x="50" y="245">3: U0RXD (RX urządzenia)</text>
+    <text x="50" y="290">4: +3.3_ESP</text>
+    <text x="50" y="335">5: RESET</text>
+    <text x="50" y="380">6: BOOTSEL (GPIO9 ESP32-C3)</text>
+    <text x="50" y="425">7: GND</text>
+  </g>
+
+  <rect x="790" y="95" width="320" height="235" rx="12" fill="#f0f4ff" stroke="#3f51b5" stroke-width="2"/>
+  <text x="815" y="122" font-size="17" font-weight="bold" fill="#283593">USB-UART / źródło 3,3 V</text>
+  <g fill="#fff" stroke="#3f51b5" stroke-width="2">
+    <rect x="780" y="140" width="20" height="20"/>
+    <rect x="780" y="185" width="20" height="20"/>
+    <rect x="780" y="230" width="20" height="20"/>
+    <rect x="780" y="275" width="20" height="20"/>
+  </g>
+  <g font-size="15" fill="#222">
+    <text x="820" y="155">3V3 (stabilne zasilanie)</text>
+    <text x="820" y="200">TX (logika 3,3 V)</text>
+    <text x="820" y="245">RX</text>
+    <text x="820" y="290">GND (wspólna masa)</text>
+  </g>
+
+  <!-- RX/TX mają osobne trasy. Skrzyżowania bez kropek nie są połączeniami. -->
+  <polyline id="uart-tx" points="400,195 470,195 470,215 650,215 650,240 780,240" fill="none" stroke="#2e7d32" stroke-width="3"/>
+  <polyline id="uart-rx" points="400,240 490,240 490,260 690,260 690,195 780,195" fill="none" stroke="#e67e22" stroke-width="3"/>
+  <polyline id="supply" points="400,285 520,285 520,150 780,150" fill="none" stroke="#c62828" stroke-width="3"/>
+  <polyline id="ground" points="400,420 730,420 730,285 780,285" fill="none" stroke="#1565c0" stroke-width="3"/>
+
+  <!-- Obie opcjonalne zworki kończą się dokładnie na linii GND. -->
+  <polyline id="boot-jumper" points="400,375 600,375 600,420" fill="none" stroke="#ad7100" stroke-width="3" stroke-dasharray="7 4"/>
+  <circle id="boot-ground-junction" cx="600" cy="420" r="5" fill="#1565c0"/>
+  <polyline id="reset-jumper" points="400,330 670,330 670,420" fill="none" stroke="#66717e" stroke-width="2.5" stroke-dasharray="5 4"/>
+  <circle cx="670" cy="420" r="5" fill="#1565c0"/>
+  <text x="795" y="365" font-size="14" fill="#ad7100">BOOTSEL: do GND przy resecie.</text>
+  <text x="795" y="390" font-size="14" fill="#555">RESET: tylko chwilowo do GND.</text>
+  <text x="450" y="450" font-size="13" fill="#555">Kropka = połączenie. Skrzyżowanie bez kropki = brak połączenia.</text>
+
+  <text x="30" y="495" font-size="14" fill="#333">Numery 1–7 oznaczają styki złącza, nie GPIO. Styk 1 to ESP_DBG_UART, styk 7 to GND.</text>
+  <text x="30" y="520" font-size="14" fill="#333">Starszy rysunek Shelly nazywa styk 6 „GPIO0”. W C3 BOOTSEL to GPIO9, nie reset ADE7953 na GPIO0.</text>
+  <text x="30" y="545" font-size="14" fill="#333">Start aplikacji: usuń zworkę BOOTSEL i wykonaj reset. Konfiguracja SUPLA: potem przytrzymaj CFG ~5 s.</text>
+
+  <rect x="30" y="565" width="1080" height="120" rx="10" fill="#fff3f3" stroke="#c62828" stroke-width="2"/>
+  <text x="50" y="592" font-size="17" font-weight="bold" fill="#b00020">Wyłącznie bez 230 V, również podczas diagnostyki Serial.</text>
+  <text x="50" y="618" font-size="14" fill="#333">Nie dotykaj otwartego modułu pod napięciem. Zasilanie i UART: 3,3 V, nigdy 5 V. Nie podłączaj DTR/RTS.</text>
+  <text x="50" y="642" font-size="14" fill="#333">Przy osobnym źródle 3,3 V połącz masy, ale nie łącz równolegle wyjść zasilających źródła i adaptera.</text>
+  <text x="50" y="666" font-size="14" fill="#333">Przed powrotem do instalacji odłącz wszystkie przewody programatora i zamknij obudowę.</text>
+</svg>

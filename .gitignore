@@ -1,2 +1,38 @@
+# Klony bibliotek referencyjnych (tylko do czytania, nie do kompilacji)
 lib/supla-device/
 lib/gui-generic/
+lib/home_io_control/
+
+# Artefakty kompilacji Arduino / PlatformIO
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.merged.bin
+*.elf
+*.map
+*.hex
+*.d
+*.o
+*.a
+
+# Zdalne cache Arduino CLI
+**/.arduino15/
+
+# Sekrety
+secrets.h
+secrets.local.h
+.env
+.env.*
+credentials.json
+
+# System
+.DS_Store
+._*
+.history/
+.factory/settings.local.json
+
+# Edytory
+.vscode/ipch/
+*.swp
