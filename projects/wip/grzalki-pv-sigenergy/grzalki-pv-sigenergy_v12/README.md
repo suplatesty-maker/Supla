@@ -271,6 +271,36 @@ Sprawdzenie kontraktów źródeł (bez kompilatora i sprzętu):
 python3 "/Users/serwerhome/Projects/supla-esp32-base/projects/wip/grzalki-pv-sigenergy/grzalki-pv-sigenergy_v12/verify_source.py"
 ```
 
+## Wgranie
+
+Normalnie, gdy ESP32 jest podłączony do komputera z Arduino CLI:
+
+```bash
+arduino-cli upload -p /dev/cu.usbserial-XXXX \
+  --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=460800 \
+  "/Users/serwerhome/Projects/supla-esp32-base/projects/wip/grzalki-pv-sigenergy/grzalki-pv-sigenergy_v12"
+```
+
+Gdy buduje Mac, a wgrywa laptop z Windows (albo gdy portu nie ma na Macu),
+użyj gotowego obrazu z katalogu nadrzędnego:
+
+```
+../firmware-v12-merged.bin
+```
+
+Obraz scala bootloader (0x1000), tablicę partycji (0x8000), `boot_app0`
+(0xE000) i aplikację (0x10000) w jeden plik flashowany od 0x0. Ten sam układ
+partycji `huge_app`, na którym działa v11 — wgranie nie zmienia partycji
+i nie kasuje konfiguracji LittleFS.
+
+```powershell
+pip install esptool
+esptool --chip esp32 --port COM3 --baud 115200 write-flash 0x0 firmware-v12-merged.bin
+```
+
+Plik `*.bin` jest w `.gitignore`, więc obraz nie trafia do repozytorium.
+Po wgraniu w Serialu musi pojawić się `=== PV heaters v12 ===`.
+
 ## Pliki
 
 - `grzalki-pv-sigenergy_v12.ino` — SUPLA, WiFi, WWW, Modbus Sigenergy,

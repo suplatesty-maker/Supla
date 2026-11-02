@@ -27,6 +27,27 @@ arduino-cli upload -p /dev/cu.usbserial-XXXX \
   "/Users/serwerhome/Projects/supla-esp32-base/projects/wip/grzalki-pv-sigenergy/grzalki-pv-sigenergy_v12"
 ```
 
+**Gotowy plik do wgrania z innego komputera:**
+`firmware-v12-merged.bin` w katalogu projektu (1 467 408 B, obraz od adresu
+0x0). Plik jest w `.gitignore`, więc nie trafi do repozytorium — trzeba go
+skopiować na laptopa osobno. SHA256:
+
+```
+643816de123edc525406a75ea2e8c29d0cee204f157b07625f1910e4b9c15b38
+```
+
+Zawartość obrazu sprawdzona: bootloader pod 0x1000 (`E9`), tablica partycji
+pod 0x8000 (`AA50`), aplikacja pod 0x10000 (`E9`). Schemat `huge_app`, czyli
+ten sam układ partycji, na którym działa v11 — wgranie nie zmienia układu
+partycji i nie kasuje konfiguracji LittleFS.
+
+Wgranie na Windows (Lenovo, kabel USB):
+
+```powershell
+pip install esptool
+esptool --chip esp32 --port COM3 --baud 115200 write-flash 0x0 firmware-v12-merged.bin
+```
+
 Po wgraniu sprawdź w Serialu baner `=== PV heaters v12 ===` i stabilny GUID.
 Jeśli GUID się zmienił, urządzenie trzeba ponownie dodać w cloud.supla.org.
 
