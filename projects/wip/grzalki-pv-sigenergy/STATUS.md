@@ -1,5 +1,35 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-02 (2): v12 zapisana na Macu, nie wgrana
+
+**Aktualna wersja robocza: `grzalki-pv-sigenergy_v12/`.** v12 jest kopią v11
+plus poprawka wyświetlania kanału 5. **Nie wgrana** — port USB zniknął
+z systemu i nadal go nie ma (`arduino-cli board list` pokazuje tylko porty
+Bluetooth i debug). Na płytce działa v11 **bez** poprawki kanału 5.
+
+Zmiany v12 względem v11:
+
+- `controller.h`: `publish()` wysyła ostatnią zaakceptowaną moc sieci zamiast
+  `NAN`, więc kanał 5 nie gaśnie przy przełączaniu grzałek. Nieświeżość
+  sygnalizuje kanał 4, a AUTO nadal wymaga świeżej próbki.
+- `SuplaDevice.setName("PV heaters v12")` i baner `=== PV heaters v12 ===`,
+  żeby logu i nazwy urządzenia nie można było pomylić z v11.
+- Plik szkicu to `grzalki-pv-sigenergy_v12.ino`, ścieżki w README i testach
+  wskazują na v12.
+- Weryfikacja: kompilacja **EXIT=0** (flash 1 401 703 B / 44%,
+  RAM 52 260 B / 15%), `verify_source.py` **26/26 OK**.
+
+Wgranie, gdy port wróci:
+
+```bash
+arduino-cli upload -p /dev/cu.usbserial-XXXX \
+  --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=460800 \
+  "/Users/serwerhome/Projects/supla-esp32-base/projects/wip/grzalki-pv-sigenergy/grzalki-pv-sigenergy_v12"
+```
+
+Po wgraniu sprawdź w Serialu baner `=== PV heaters v12 ===` i stabilny GUID.
+Jeśli GUID się zmienił, urządzenie trzeba ponownie dodać w cloud.supla.org.
+
 ## Aktualizacja 2026-11-02: v11 wgrana, kanał mocy nie gaśnie przy przełączaniu
 
 **v11 wgrana na ESP32 (port CH340, 460800, hash zweryfikowany). Grzałki 230 V
