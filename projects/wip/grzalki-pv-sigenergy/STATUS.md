@@ -1,5 +1,58 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-06: v15 — suwak grzałki regulowanej, usunięte PV/ESS/SOC
+
+**Aktualna wersja robocza: `grzalki-pv-sigenergy_v15/`. Skompilowana i
+sprawdzona, nie wgrana** (brak portu USB na Macu).
+
+Zmiany v15 względem v12:
+
+- **Nowy kanał 9 „Grzałka regulowana (SSR)”.** Do v12 tryb MANUAL zawsze
+  wymuszał 0 V na DAC, więc grzałką regulowaną nie dało się sterować z SUPLA.
+  Teraz kanał 9 włącza ją na pełną moc (`ssr_max_power`, np. 10 V = 1500 W)
+  po 1 s anti-chatter i wyłącza natychmiast.
+- **Usunięte kanały PV, baterii ESS i SOC** wraz z odczytami Modbus
+  30035–30038 i 30014. Moc sieci (kanał 5), status CT 30004 i kontrola
+  on-grid 30009 zostają.
+- Nowa numeracja powyżej 8: 9 = grzałka regulowana, 10 = alarm CT.
+  Kanały 0–8 bez zmian.
+- `Commands::heater[3]`, trzeci slot popytu; `Heating::manualSsr()` decyduje
+  o SSR w MANUAL; `sameCommand()` porównuje też rewizję SSR.
+- `cfg.ssrValid` (`ssr_max_power > 0`) rozdzielony od `safetyValid`, bo
+  `writeSsr()` dzieli przez tę wartość, a zła konfiguracja SSR nie może
+  blokować H2/H3.
+
+Zachowanie bezpieczeństwa (bez zmian intencji): awaria DAC blokuje kanał 9
+i zapala kanał 7; niepotwierdzony zapis DAC wyłącza **wszystkie** grzałki
+i próbuje wyzerować wyjście.
+
+Weryfikacja:
+
+- kompilacja `EXIT=0`, flash 1 400 995 B (44%), RAM 52 212 B (15%),
+  `--warnings all` bez ostrzeżeń własnych (tylko deprecjacje modbus-esp8266),
+- `verify_source.py` **31/31 OK**,
+- test decyzji na hoście (`g++`, ten sam `control_logic.h`): **18/18 OK**.
+  Sprawdzone: ON po 1 s → pełna moc, ON przed upływem → 0, OFF natychmiast,
+  OFF przy awarii DAC → 0, `ssr_max_power=0` → 0, AUTO nadal proporcjonalne,
+  brak czujnika/przegrzanie/wygasły timer blokują SSR.
+
+**Do zrobienia przy wgraniu:** sprawdzić `CFG ... ssrValid=1`, potem kanał 9
+bez grzałki (multimetr na wyjściu DAC: 0 → ~10 V → 0). Kanały 9–12 z v12
+zniknęły, więc SUPLA przydzieli numery od nowa powyżej 8.
+
+Gotowy obraz do wgrania z laptopa: `firmware-v15-merged.bin` (1 466 688 B,
+flash od 0x0). Offsety sprawdzone: bootloader `E9` @0x1000, partycje `AA50`
+@0x8000, aplikacja `E9` @0x10000. Układ `huge_app`, ten sam co v11, więc
+konfiguracja LittleFS zostaje. SHA256:
+
+```
+8e90fc8fd2e0af5e1bb56637f7f20bb4a68c38fe55e79f57e147f80338c7e8a8
+```
+
+```powershell
+esptool --chip esp32 --port COM3 --baud 115200 write-flash 0x0 firmware-v15-merged.bin
+```
+
 ## Aktualizacja 2026-11-02 (2): v12 zapisana na Macu, nie wgrana
 
 **Aktualna wersja robocza: `grzalki-pv-sigenergy_v12/`.** v12 jest kopią v11
