@@ -1,5 +1,64 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-10 (2): v16 — suwak SSR jako wyłącznik główny
+
+**v16 cofa błąd v15.** W v15 suwak „Grzałka regulowana (SSR)" był osobnym
+żądaniem MANUAL, więc:
+
+- grzałka regulowana nie działała bez włączenia MANUAL,
+- a włączenie MANUAL **odcinało H2/H3 od nadwyżki** — powyżej 2 kW grzałki 2
+  i 3 przestawały reagować na produkcję.
+
+Potwierdzone w kodzie: `Engine::step()` miał jeden `if (input.command.manual)`
+obejmujący wszystkie trzy grzałki, a `Mailbox::demand()` odrzucał każde żądanie
+ON bez `manual`. Stąd dokładnie ten objaw, który zgłosił użytkownik.
+
+Zmiany v16:
+
+- **MANUAL znów dotyczy tylko H2/H3** — `nextSsr = 0` w gałęzi MANUAL, tak jak
+  w v11/v12. H2/H3 w AUTO nadal sterowane progami `h2_on`/`h3_on`.
+- **Kanał 9 to wyłącznik główny regulatora**, nie żądanie grzania:
+  `Commands::ssrEnabled` zamiast `Demand heater[2]`.
+  - ON = regulator uzbrojony, ale bez nadwyżki DAC pozostaje 0 V.
+  - OFF = DAC natychmiast 0 V, niezależnie od nadwyżki i trybu.
+  - `ssrEnabled` **nie jest czyszczony** przez `revokeLocked()`, więc zmiana
+    MANUAL/AUTO ani chwilowa awaria nie rozbraja regulatora.
+  - OFF działa zawsze (także przy awarii DAC / braku czujnika / przegrzaniu),
+    bo odcięcie grzałki nie może być zablokowane przez błąd.
+  - ON jest blokowane przy `dacFault`, braku GP8403 lub `ssr_max_power=0`.
+  - Po restarcie suwak wraca na ON (`setDefaultStateOn`).
+- Nowa funkcja `Heating::ssrAllowed(enabled, dacFault, powerValid)`; usunięta
+  `manualSsr()`, `sameCommand()` wróciło do trzech rewizji plus porównanie
+  `ssrEnabled`.
+- Kolejność grzania w AUTO bez zmian: SSR dostaje nadwyżkę do `ssr_max_power`,
+  powyżej `h2_on` dołączają H2/H3. Przy `budget=1600 W` SSR ma pełne 1500 W,
+  a H2 jeszcze nie startuje.
+
+Weryfikacja:
+
+- kompilacja `EXIT=0`, flash 1 401 175 B (44%), RAM 52 196 B (15%),
+  `--warnings all` bez własnych ostrzeżeń,
+- `verify_source.py` **31/31 OK**,
+- test decyzji na hoście (`g++`, ten sam `control_logic.h`) **16/16 OK**.
+  Sprawdzone m.in.: `SSR OFF` wymusza 0 V mimo nadwyżki 400 W, H2 startuje
+  z nadwyżki niezależnie od suwaka SSR, awaria DAC i `ssr_max_power=0`
+  blokują SSR.
+
+**v16 nie jest jeszcze wgrana** — port USB nieobecny (`ls /dev/cu.*` pokazuje
+tylko Bluetooth i debug). Gotowy obraz: `firmware-v16-merged.bin`
+(1 466 800 B, flash od 0x0, offsety `E9`/`AA50`/`E9` sprawdzone). SHA256:
+
+```
+c965ce5cc302ddab93a13ea8245bf1170f7becfc1bc11c8eb7c5cd7494a6526c
+```
+
+```powershell
+esptool --chip esp32 --port COM3 --baud 115200 write-flash 0x0 firmware-v16-merged.bin
+```
+
+Po wgraniu sprawdzić w logu: `=== PV heaters v16 ===` oraz
+`SSR master switch ON (regulator armed)`. W MANUAL DAC musi zostać na 0 V.
+
 ## Aktualizacja 2026-11-10: v15 WGRANA na ESP32
 
 **v15 działa na płytce.** Port tym razem nazywał się `/dev/cu.usbserial-2140`
