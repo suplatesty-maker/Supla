@@ -1,9 +1,61 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-10: v15 WGRANA na ESP32
+
+**v15 działa na płytce.** Port tym razem nazywał się `/dev/cu.usbserial-2140`
+(wcześniej `-2110`, numer zmienia się przy każdym podłączeniu — nie wpisuj go
+na sztywno do skryptów bez sprawdzenia `arduino-cli board list`).
+
+```
+arduino-cli upload -p /dev/cu.usbserial-2140 \
+  --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=460800 \
+  grzalki-pv-sigenergy_v15
+
+Wrote 1401136 bytes (844679 compressed) at 0x00010000 in 22.2 seconds
+Hash of data verified.
+```
+
+Potwierdzenie z Seriala — format `DIAG` jest już v15 (nie ma `pv=`, `ess=`,
+`soc=`):
+
+```
+DIAG heap=199428 min=190112 h2=0 h3=0 ssr=0 temp=nan sensorFault=1
+     grid=0 nanW ct=0 on=0 result=0
+```
+
+- `heap=199428` — 199 kB wolnego, dużo zapasu.
+- `sensorFault=1`, `temp=nan` — brak DS18B20, zgodnie z tym co podłączone.
+- `ssr=0` — DAC nieaktywny, brak GP8403.
+- `grid=0`, `nanW` — brak `inverter_ip` / brak WiFi.
+
+**Czego nie udało się sprawdzić:** pełnego bannera `=== PV heaters v15 ===`,
+`CFG` i `GUID`. Port USB zniknął z systemu po wgraniu (RTS reset przy
+odłączonej płytce albo problem z kablem/zasilaniem). Kolejne 30 s czekania nie
+przywróciło urządzenia. Gdy port wróci, wystarczy:
+
+```bash
+python3 - <<'PY'
+# albo po prostu: arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
+PY
+```
+
+i sprawdzić w pierwszym logu: `=== PV heaters v15 ===`, `CFG ... ssrValid=`,
+`GUID`, oraz czy `nowyAuthKey=False`.
+
+**Do sprawdzenia przy pierwszym uruchomieniu z pełnym osprzętem:**
+
+1. `CFG safetyValid=1 ssrValid=1 autoValid=1` — jeśli `ssrValid=0`, wpisz
+   `ssr_max_power` > 0 w WWW.
+2. Kanał 9 „Grzałka regulowana (SSR)" w SUPLA — włącz, zmierz multimetrem
+   wyjście DAC (0 V → ~10 V po 1 s → 0 V po OFF).
+3. Numeracja: kanały 9–12 z v12 zniknęły, więc 9 to teraz SSR, 10 to CT.
+   W cloud.supla.org może być potrzebne odświeżenie/ponowne dodanie kanałów.
+4. Grzałki 230 V dopiero po zamontowaniu snubbera (100 Ω 1 W + 100 nF X2
+   na stykach) i warystora S14K275.
+
 ## Aktualizacja 2026-11-06: v15 — suwak grzałki regulowanej, usunięte PV/ESS/SOC
 
-**Aktualna wersja robocza: `grzalki-pv-sigenergy_v15/`. Skompilowana i
-sprawdzona, nie wgrana** (brak portu USB na Macu).
+**Aktualna wersja robocza: `grzalki-pv-sigenergy_v15/`.**
 
 Zmiany v15 względem v12:
 

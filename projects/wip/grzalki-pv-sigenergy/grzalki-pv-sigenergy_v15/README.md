@@ -360,9 +360,11 @@ Po wgraniu w Serialu musi pojawić się `=== PV heaters v15 ===`.
 
 ## Ograniczenia
 
-- v15 nie była jeszcze wgrana na płytkę i nie jest testowana na sprzęcie.
+- v15 jest **wgrana na płytkę** (2026-11-10). Log startowy potwierdził format
+  `DIAG` v15, ale pełnego bannera `CFG`/`GUID` nie udało się odebrać, bo port
+  USB zniknął po wgraniu. Testów z grzałkami i z DAC nie było.
 - v11 była wgrana na gołą płytkę (bez DAC, bez DS18B20, grzałki odłączone).
-  v12 i v15 są skompilowane i sprawdzone kontraktami, ale nie wgrane.
+- v12 jest skompilowana i sprawdzona kontraktami, ale nie była wgrana.
 - v11 była wgrana na gołą płytkę (bez DAC, bez DS18B20, grzałki odłączone);
   konfiguracja i AuthKey są stabilne, kanały w stanie alarmu zgodnie z brakiem
   czujników. Testów z obciążeniem nie było.
