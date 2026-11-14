@@ -1,5 +1,85 @@
 # grzalki-pv-sigenergy — STATUS
 
+## Aktualizacja 2026-11-10 (3): v17 — suwak 9 to globalny STOP
+
+**Zgłoszenie użytkownika z v16:** suwak SSR włączony, AUTO, PV ponad 2 kW,
+H2 się załączyła. Po wyłączeniu suwaka H2 **została włączona** i dopiero MANUAL
+ją zgasił. Pytanie: czy wyłączenie suwaka ma gasić pozostałe grzałki?
+
+**Odpowiedź w v16 brzmiała „nie, to celowe”. Użytkownik zdecydował, że ma
+gasić wszystko.** v17 to implementuje.
+
+Co dokładnie sprawdzono w kodzie v16 (i potwierdzono na hoście):
+
+- `controller.h:295-298` — suwak OFF wchodził tylko w `nextSsr`. `next2`
+  i `next3` dalej liczyły się z `budget`, więc przy nadwyżce > `h2_off`
+  (1450 W) H2 pozostawała włączona. Zachowanie zgodne z kodem, nie losowe.
+- Suwak OFF **nie** był kasowany przez `revokeLocked()`, więc był trwały.
+
+Zmiany v17:
+
+- **Nowe `Commands::master`** zamiast `ssrEnabled`; `Mailbox::setMaster()`.
+- **Jedna bramka na wszystkie wyjścia** (`controller.h:293-300`):
+  `next2/next3` przez `Heating::masterAllows(master, ...)`, `nextSsr = master ?
+  nextSsr : 0`, potem `ssrAllowed()`. Bramka stoi po obu gałęziach (MANUAL i
+  AUTO), tuż przed `apply()`, więc działa co tick i żadna gałąź jej nie omija.
+- **STOP omija `dwell`** — przy `dwell = 60 s` AUTO trzyma H2 do minuty po
+  spadku nadwyżki, STOP gasi w jednym ticku (50 ms).
+- **STOP nie zmienia trybu** — po powrocie na ON instalacja wraca do AUTO albo
+  MANUAL, z pamięcią suwaków H2/H3.
+- **H2/H3 odmawiają włączenia przy STOP** (`H2 ON rejected: master switch
+  OFF`), żeby aplikacja nie pokazywała ON dla przekaźnika, który silnik zgasi.
+- Podpis kanału 9: **„STOP: wyłącznik główny"**, nazwa urządzenia
+  `PV heaters v17`.
+- `publish()` bez nieużywanego parametru; `status.requestAllowed` uwzględnia
+  teraz `master`.
+
+Weryfikacja v17:
+
+- kompilacja `EXIT=0`, flash 1 401 255 B (44%), RAM 52 196 B (15%),
+  `--warnings all` bez ostrzeżeń z własnych plików,
+- `verify_source.py` **33/33 OK** (nowe testy: bramka na trzech wyjściach,
+  STOP nie kasuje trybu, STOP przeżywa `revokeLocked`),
+- **testy na prawdziwym `Engine`** (`host_test/run.sh`, g++ na Macu, atrapy
+  tylko dla Arduino/FreeRTOS/1-Wire/Supla) **33/33 OK**:
+
+| Scenariusz | Wynik |
+|---|---|
+| AUTO, PV 3400 W, STOP OFF | H2+H3+DAC w 0.2 s, GPIO25/26 = LOW |
+| STOP trzyma 120 s przy PV 3400 W | nic się nie włącza |
+| STOP ON | AUTO wraca samo, bez dotykania trybu |
+| MANUAL H2+H3, potem STOP | obie gasną, tryb MANUAL zostaje |
+| STOP ON w MANUAL | suwaki H2/H3 pamiętają stan |
+| STOP OFF + żądanie H2 | silnik nie włącza, po STOP ON realizuje |
+| STOP OFF → awaria czujnika → powrót | STOP nie skasowany |
+| STOP OFF przy zerwanym Modbus | STOP trzyma po powrocie danych |
+| 60× STOP ON/OFF co 100 ms | każde OFF natychmiast gasi wszystko |
+| **Zgłoszenie: PV 2200 W, H2 ON, suwak OFF** | **H2 gaśnie razem z suwakiem** |
+| AUTO: 1600 / 2100 / 3500 / 3000 / 1500 / 1200 W | progi i histereza zgodne |
+| dwell 60 s | AUTO czeka, STOP działa od razu |
+
+Odkryte przy okazji (nie błąd, warto znać): przy PV 1500 W i włączonej H2
+budżet wynosi 1500 W, czyli powyżej `h2_off` = 1450 W, więc H2 **trzyma** —
+cała produkcja idzie w grzałkę i nic nie idzie do sieci. H2 spada dopiero
+poniżej 1450 W nadwyżki.
+
+**v17 nie jest wgrana** — port USB nadal nieobecny. Gotowy obraz:
+`firmware-v17-merged.bin` (1 466 944 B, offsety `E9` @0x1000, `AA50` @0x8000,
+`E9` @0x10000 sprawdzone). SHA256:
+
+```
+789d0e31a418ff6f4d15b39084fe74af8e542b77c663e8509a913f6e5514e2a8
+```
+
+```powershell
+esptool --chip esp32 --port COM3 --baud 115200 write-flash 0x0 firmware-v17-merged.bin
+```
+
+Po wgraniu sprawdzić w logu: `=== PV heaters v17 ===` oraz
+`Master switch ON (heating enabled)`. Wyłączenie kanału 9 musi dać
+`STOP: master switch OFF (H2, H3, DAC -> OFF)`, a H2/H3 mają zgasnąć razem
+z DAC.
+
 ## Aktualizacja 2026-11-10 (2): v16 — suwak SSR jako wyłącznik główny
 
 **v16 cofa błąd v15.** W v15 suwak „Grzałka regulowana (SSR)" był osobnym
